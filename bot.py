@@ -21,6 +21,7 @@ Auto Balance system (SQLite database):
     /exportbalances  (shudhu admin, balance-er backup list)
   /broadcast <message>  (shudhu admin, sob user-ke message pathay)
   /sendvpn <user_id> <details>  (shudhu admin, customer-ke VPN account pathay)
+  /users  (shudhu admin, mot bot user sonkha dekhay)
 
 Guruttopurno sotorkota (Render FREE):
   Balance-er data ei bot-er SQLite file-e (balance.db) thake.
@@ -229,6 +230,13 @@ def get_all_user_ids():
     rows = conn.execute("SELECT user_id FROM users").fetchall()
     conn.close()
     return [row[0] for row in rows]
+
+
+def get_user_count():
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+    conn.close()
+    return row[0] if row else 0
 
 
 # ---------------- Health server (Render free) ----------------
@@ -663,6 +671,15 @@ async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {target_id}-কে পাঠানো হয়েছে।")
 
 
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    count = get_user_count()
+    await update.message.reply_text(f"👥 মোট বট ইউজার: {count} জন\n(এরা সবাই বটে /start করেছে।)")
+
+
 # ---------------- Text / photo input ----------------
 
 async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -802,6 +819,7 @@ def main():
     app.add_handler(CommandHandler("exportbalances", exportbalances_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("sendvpn", sendvpn_command))
+    app.add_handler(CommandHandler("users", users_command))
     app.add_handler(MessageHandler(filters.Regex("Buy VPN"), menu_buy_vpn))
     app.add_handler(MessageHandler(filters.Regex("Buy Proxy"), menu_buy_proxy))
     app.add_handler(MessageHandler(filters.Regex("Balance"), menu_balance))
