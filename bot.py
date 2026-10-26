@@ -19,6 +19,8 @@ Auto Balance system (SQLite database):
     VPN account pathabe). Balance kom thakle age Deposit korte hobe.
   - Admin command: /addbalance <user_id> <taka>  (shudhu admin)
     /exportbalances  (shudhu admin, balance-er backup list)
+  /broadcast <message>  (shudhu admin, sob user-ke message pathay)
+  /sendvpn <user_id> <details>  (shudhu admin, customer-ke VPN account pathay)
 
 Guruttopurno sotorkota (Render FREE):
   Balance-er data ei bot-er SQLite file-e (balance.db) thake.
@@ -40,6 +42,7 @@ Run:
   BOT_TOKEN=... ADMIN_ID=... python bot.py
 """
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -221,6 +224,13 @@ def set_deposit_status(dep_id, status):
     conn.close()
 
 
+def get_all_user_ids():
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 # ---------------- Health server (Render free) ----------------
 
 def start_health_server():
@@ -322,6 +332,7 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("deposit_amount", None)
     await update.message.reply_text(
         "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
+        "Minimum deposit ৳20।\n"
         "যেমন: 100\n\n"
         f"টাকা পাঠাবেন এই নম্বরে:\nবিকাশ / নগদ: {PAYMENT_NUMBER}"
     )
@@ -584,6 +595,74 @@ async def exportbalances_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(text)
 
 
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    message = " ".join(context.args).strip()
+    if not message:
+        await update.message.reply_text(
+            "ব্যবহার: /broadcast <মেসেজ>\nযেমন: /broadcast নতুন অফার! আজ থেকে সব VPN-এ ছাড়।"
+        )
+        return
+    if len(message) > 4000:
+        await update.message.reply_text("মেসেজটা অনেক বড়, ৪০০০ অক্ষরের মধ্যে লিখুন।")
+        return
+    user_ids = get_all_user_ids()
+    if not user_ids:
+        await update.message.reply_text("কোনো ইউজার পাওয়া যায়নি। কেউ /start করলে তবেই broadcast যাবে।")
+        return
+    await update.message.reply_text(f"📢 Broadcast শুরু হচ্ছে, মোট ইউজার: {len(user_ids)} জন...")
+    text = f"📢 SM SHADIN Shop:\n\n{message}"
+    success = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            success += 1
+        except Exception as exc:
+            logger.warning("Broadcast pathate parini %s: %s", uid, exc)
+            failed += 1
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(f"✅ Broadcast শেষ! পেয়েছে: {success} জন, পায়নি: {failed} জন।")
+
+
+async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "ব্যবহার: /sendvpn <user_id> <VPN details>\n"
+            "যেমন: /sendvpn 123456789 NordVPN username: abc password: xyz server: us1"
+        )
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID সংখ্যায় লিখতে হবে। যেমন: /sendvpn 123456789 username: abc")
+        return
+    details = " ".join(context.args[1:]).strip()
+    if not details:
+        await update.message.reply_text("VPN details লিখতে হবে। যেমন: /sendvpn 123456789 username: abc password: xyz")
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎉 আপনার VPN অ্যাকাউন্ট রেডি!\n\n{details}\n\n"
+            f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}",
+        )
+    except Exception as exc:
+        logger.warning("VPN pathate parini %s: %s", target_id, exc)
+        await update.message.reply_text(
+            f"❌ User {target_id}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+        )
+        return
+    await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {target_id}-কে পাঠানো হয়েছে।")
+
+
 # ---------------- Text / photo input ----------------
 
 async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,8 +686,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 "শুধু সংখ্যাটা লিখুন। যেমন: 100"
             )
             return
-        if amount <= 0:
-            await update.message.reply_text("টাকার পরিমাণ 0-এর বেশি হতে হবে। যেমন: 100")
+        if amount < 20:
+            await update.message.reply_text("Minimum deposit ৳20। 20 বা তার বেশি লিখুন। যেমন: 100")
             return
         context.user_data["deposit_amount"] = amount
         context.user_data["state"] = WAITING_DEPOSIT_PROOF
@@ -721,6 +800,8 @@ def main():
     app.add_handler(CommandHandler("support", support_command))
     app.add_handler(CommandHandler("addbalance", addbalance_command))
     app.add_handler(CommandHandler("exportbalances", exportbalances_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("sendvpn", sendvpn_command))
     app.add_handler(MessageHandler(filters.Regex("Buy VPN"), menu_buy_vpn))
     app.add_handler(MessageHandler(filters.Regex("Buy Proxy"), menu_buy_proxy))
     app.add_handler(MessageHandler(filters.Regex("Balance"), menu_balance))
