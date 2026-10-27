@@ -11,9 +11,15 @@ Auto Balance system (SQLite database):
   - /start korlei user-er account toiri hoy, balance surute ৳0
   - Balance button-e chap dile asol balance dekhay
   - Deposit: age taka-r poriman likhun, tarpor TrxID / screenshot
-    pathan. Admin-er kache Approve / Reject button soho request jabe.
-    Admin Approve chaplei balance-e taka jog hoye jabe, customer-ke
-    janiye deoa hobe.
+    pathan. SMS AutoPay chalu thakle: TrxID + amount jodi apnar
+    phone-e asa bKash/Nagad SMS-er sathe exactly mile, tahole
+    balance AUTO jog hobe, admin Approve lagbe na. Na mille
+    ager moto admin-er kache Approve / Reject request jabe
+    (backup, jate customer-er taka na atke).
+    SMS ashe apnar phone-er SMS forwarder app theke, bot-er
+    POST /sms endpoint-e, secret diye. PIN kokhono bot-ke
+    dite hobe na, PIN charai ei system chole.
+    Ek TrxID diye dubar balance deoa jabe na (used check ache).
   - Buy VPN: package beche Balance diye kinte parben (balance
     porjapto thakle dam kete jabe, order admin-er kache jabe, admin
     VPN account pathabe). Balance kom thakle age Deposit korte hobe.
@@ -50,8 +56,10 @@ Run:
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +88,10 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = os.environ.get("ADMIN_ID", "")
+# SMS AutoPay secret: Render env-e set korte hobe, code-e kokhono likhbe na.
+# SMS forwarder app ei secret pathabe, na mille /sms request reject hobe.
+# Secret na thakle /sms bondho thakbe, auto-match cholbe na.
+SMS_SECRET = os.environ.get("SMS_SECRET", "")
 DB_PATH = os.environ.get("DB_PATH", "balance.db")
 
 BOT_USERNAME = "sm_shadin_shop_bot"
@@ -174,8 +186,94 @@ def init_db():
         "key TEXT PRIMARY KEY, "
         "value TEXT)"
     )
+    # SMS AutoPay: forwarder app theke asa bKash/Nagad SMS-er record.
+    # trxid PRIMARY KEY + used flag diye ek TrxID dubar credit atkay.
+    # Sender phone number ekhane save kora hoy na, shudhu TrxID + amount.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sms_payments ("
+        "trxid TEXT PRIMARY KEY, "
+        "amount INTEGER, "
+        "used INTEGER NOT NULL DEFAULT 0, "
+        "received_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
     conn.commit()
     conn.close()
+
+
+def parse_sms_payment(text, trxid_hint="", amount_hint=0):
+    """bKash/Nagad SMS text theke TrxID + amount ber korun.
+
+    Returns (trxid, amount) ba (None, 0) jodi na paoa jay.
+    PIN ba password kokhono ekhane asbe na, shudhu SMS-er TrxID/amount.
+    """
+    if not text:
+        return (trxid_hint.upper() if trxid_hint else None, int(amount_hint or 0))
+    upper = text.upper()
+    trxid = None
+    m = re.search(r"TRX\s*ID\s*[:\-]?\s*([A-Z0-9]{8,12})", upper)
+    if m:
+        trxid = m.group(1)
+    elif trxid_hint:
+        trxid = trxid_hint.upper()
+    amount = 0
+    m2 = re.search(r"TK\.?\s*([\d,]+(?:\.\d+)?)", upper)
+    if m2:
+        try:
+            amount = int(round(float(m2.group(1).replace(",", ""))))
+        except ValueError:
+            amount = 0
+    if not amount and amount_hint:
+        amount = int(amount_hint)
+    return (trxid, amount)
+
+
+def save_sms_payment(trxid, amount):
+    if not trxid or not amount:
+        return False
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO sms_payments (trxid, amount, used)"
+        " VALUES (?, ?, 0)",
+        (trxid.upper(), int(amount)),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def find_unused_sms(trxid, amount):
+    """TrxID + amount exactly mile, ekhono bebohar hoyni, amon SMS khujun."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT trxid, amount FROM sms_payments "
+        "WHERE trxid = ? AND amount = ? AND used = 0",
+        (trxid.upper(), int(amount)),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_sms_used(trxid):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE sms_payments SET used = 1 WHERE trxid = ?", (trxid.upper(),)
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_trxid_already_credited(trxid):
+    """Ei TrxID diye age balance deoa hoyeche kina (auto ba manual)."""
+    if not trxid:
+        return False
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id FROM deposits WHERE UPPER(trxid) = ? "
+        "AND status IN ('approved', 'auto_approved')",
+        (trxid.upper(),),
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 def ensure_user(user):
@@ -288,7 +386,16 @@ def set_setting(key, value):
 # ---------------- Health server (Render free) ----------------
 
 def start_health_server():
-    """Render free Web Service-er health check-er jonno $PORT-e server kholo."""
+    """Render free Web Service-er health check-er jonno $PORT-e server kholo.
+
+    GET /  -> health text (keepalive ping er jonno)
+    POST /sms -> SMS forwarder app theke SMS record ney.
+      Secret chara /sms kokhono accept korbe na, nahole je keu
+      vua TrxID pathiye free balance nite parto.
+      Body JSON: {"text": "<bKash/Nagad SMS>", "secret": "..."}
+      ba header X-Secret, ba ?secret=... . Secret Render env SMS_SECRET.
+      Shudhu TrxID + amount save hoy, sender number save hoy na.
+    """
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
@@ -297,6 +404,64 @@ def start_health_server():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"SM SHADIN bot is running")
+
+        def do_POST(self):
+            try:
+                if not self.path.startswith("/sms"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if not SMS_SECRET:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b"SMS_SECRET not set")
+                    return
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    data = json.loads(raw.decode("utf-8", "ignore")) if raw else {}
+                except ValueError:
+                    data = {}
+                if not isinstance(data, dict):
+                    data = {}
+                secret = (
+                    data.get("secret", "")
+                    or self.headers.get("X-Secret", "")
+                    or ""
+                )
+                # ?secret=... query-o allow, forwarder app-e subidhar jonno
+                if "secret=" in self.path:
+                    import urllib.parse as _up
+                    q = _up.urlparse(self.path).query
+                    secret = secret or _up.parse_qs(q).get("secret", [""])[0]
+                if secret != SMS_SECRET:
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b"unauthorized")
+                    return
+                text = data.get("text", "") or data.get("message", "") or data.get("sms", "")
+                trxid, amount = parse_sms_payment(
+                    text,
+                    data.get("trxid", ""),
+                    data.get("amount", 0),
+                )
+                if not trxid or not amount:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"trxid or amount not found")
+                    return
+                save_sms_payment(trxid, amount)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "trxid": trxid, "amount": amount}).encode())
+            except Exception as exc:
+                logger.warning("SMS endpoint error: %s", exc)
+                try:
+                    self.send_response(500)
+                    self.end_headers()
+                except Exception:
+                    pass
 
         def log_message(self, *args):
             pass
@@ -932,7 +1097,9 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             f"💰 ৳{amount} Deposit-এর জন্য নিচের নম্বরে টাকা পাঠান:\n"
             f"বিকাশ / নগদ: {PAYMENT_NUMBER}\n\n"
-            "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।"
+            "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।\n"
+            "TrxID আর টাকা SMS-এর সাথে মিললে ব্যালেন্স অটো যোগ হবে, "
+            "অ্যাডমিনের Approve লাগবে না।"
         )
         return
 
@@ -949,13 +1116,56 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             trxid = (update.message.caption or "").strip()
         else:
             trxid = (update.message.text or "").strip()
+        # ---- SMS AutoPay: text TrxID hole age auto-match check korun ----
+        if not update.message.photo and trxid:
+            trxid_clean = trxid.upper().strip()
+            if " " in trxid_clean:
+                _m = re.search(r"\b[A-Z0-9]{8,12}\b", trxid_clean)
+                if _m:
+                    trxid_clean = _m.group(0)
+            if is_trxid_already_credited(trxid_clean):
+                context.user_data.clear()
+                await update.message.reply_text(
+                    "❌ এই TrxID দিয়ে আগেই ব্যালেন্স দেওয়া হয়েছে।\n"
+                    "একই TrxID দুবার ব্যবহার করা যাবে না।\n"
+                    "এটা আপনার পেমেন্ট হলে Support-এ মেসেজ করুন।"
+                )
+                return
+            if find_unused_sms(trxid_clean, amount):
+                dep_id = create_deposit(user.id, user.username, amount, trxid_clean)
+                set_deposit_status(dep_id, "auto_approved")
+                mark_sms_used(trxid_clean)
+                new_balance = add_balance(user.id, amount)
+                context.user_data.clear()
+                await update.message.reply_text(
+                    f"✅ Auto Payment সফল! ৳{amount} আপনার ব্যালেন্সে যোগ হয়েছে।\n"
+                    f"💳 বর্তমান ব্যালেন্স: ৳{new_balance}\n"
+                    f"📝 TrxID: {trxid_clean}"
+                )
+                if ADMIN_ID:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                "🤖 Auto-credited (SMS match, kono manual kaj lageni)!\n"
+                                f"👤 কাস্টমার: {customer_label(user)}\n"
+                                f"🆔 User ID: {user.id}\n"
+                                f"💵 পরিমাণ: ৳{amount}\n"
+                                f"📝 TrxID: {trxid_clean}\n"
+                                f"💳 বর্তমান ব্যালেন্স: ৳{new_balance}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                return
         dep_id = create_deposit(user.id, user.username, amount, trxid)
         caption = (
             "💰 নতুন Deposit Request!\n"
             f"👤 কাস্টমার: {customer_label(user)}\n"
             f"🆔 User ID: {user.id}\n"
             f"💵 পরিমাণ: ৳{amount}\n"
-            f"📝 TrxID / মেসেজ: {trxid or '-'}"
+            f"📝 TrxID / মেসেজ: {trxid or '-'}\n"
+            "⚠️ Auto-match hoyni (SMS ekhono aseni ba TrxID mileni) — manual check korun."
         )
         keyboard = InlineKeyboardMarkup([
             [
@@ -979,7 +1189,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         context.user_data.clear()
         await update.message.reply_text(
-            "✅ Deposit request পৌঁছেছে! অ্যাডমিন Approve করলেই "
+            "✅ Deposit request পৌঁছেছে! SMS-এর সাথে TrxID মেলেনি, তাই "
+            "অটো হয়নি — অ্যাডমিন চেক করে Approve করলে "
             "আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।"
         )
         return
