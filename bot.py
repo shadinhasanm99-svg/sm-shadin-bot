@@ -17,11 +17,17 @@ Auto Balance system (SQLite database):
   - Buy VPN: package beche Balance diye kinte parben (balance
     porjapto thakle dam kete jabe, order admin-er kache jabe, admin
     VPN account pathabe). Balance kom thakle age Deposit korte hobe.
+  - Buy Proxy: 9Proxy / RapidProxy / 711Proxy / H143Proxy
+    package beche VPN-er motoi Balance ba bKash/Nagad diye kena jay.
+    Order admin-er kache jabe, admin Proxy details pathabe
+    (/sendproxy diye).
   - Admin command: /addbalance <user_id> <taka>  (shudhu admin)
     /exportbalances  (shudhu admin, balance-er backup list)
   /broadcast <message>  (shudhu admin, sob user-ke message pathay)
   /sendvpn <user_id> <details>  (shudhu admin, customer-ke VPN account pathay)
+  /sendproxy <user_id> <details>  (shudhu admin, customer-ke Proxy details pathay)
   /users  (shudhu admin, mot bot user sonkha dekhay)
+  /away on | /away off  (shudhu admin, away mode chalu/bondho)
 
 Guruttopurno sotorkota (Render FREE):
   Balance-er data ei bot-er SQLite file-e (balance.db) thake.
@@ -95,7 +101,24 @@ PACKAGES = [
     ("HMA VPN", "30 din", 50),
 ]
 
+# Proxy package: (name, duration, price in BDT)
+# Screenshot-er dam-er upor protitite ৳10 jog kora hoyeche.
+# Jemon: 9Proxy 10 IP 49 -> 59, 9Proxy 100 MB 15 -> 25, ityadi.
+# Stock sonkha bot-e dekhano hoyni, karon bot stock auto komay na.
+PROXIES = [
+    ("10 IP (9Proxy)", "LT", 59),
+    ("100 MB (9Proxy)", "LT", 25),
+    ("200 MB (9Proxy)", "LT", 35),
+    ("100 MB (RapidProxy)", "LT", 25),
+    ("200 MB (RapidProxy)", "LT", 35),
+    ("100 MB (711Proxy)", "LT", 25),
+    ("200 MB (711Proxy)", "LT", 35),
+    ("100 MB (H143Proxy)", "LT", 19),
+    ("200 MB (H143Proxy)", "LT", 23),
+]
+
 WAITING_PAYMENT = "waiting_payment"
+WAITING_PROXY_PAYMENT = "waiting_proxy_payment"
 WAITING_DEPOSIT_AMOUNT = "waiting_deposit_amount"
 WAITING_DEPOSIT_PROOF = "waiting_deposit_proof"
 
@@ -145,6 +168,11 @@ def init_db():
         "trxid TEXT, "
         "status TEXT DEFAULT 'pending', "
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings ("
+        "key TEXT PRIMARY KEY, "
+        "value TEXT)"
     )
     conn.commit()
     conn.close()
@@ -239,6 +267,24 @@ def get_user_count():
     return row[0] if row else 0
 
 
+def get_setting(key, default=""):
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ---------------- Health server (Render free) ----------------
 
 def start_health_server():
@@ -267,6 +313,19 @@ def package_keyboard():
         buttons.append([
             InlineKeyboardButton(
                 f"{name} - {duration} - ৳{price}", callback_data=f"pkg:{i}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton("📢 Community Channel", url=CHANNEL_LINK)])
+    buttons.append([InlineKeyboardButton("💬 Support", url=ORDER_LINK)])
+    return InlineKeyboardMarkup(buttons)
+
+
+def proxy_keyboard():
+    buttons = []
+    for i, (name, duration, price) in enumerate(PROXIES):
+        buttons.append([
+            InlineKeyboardButton(
+                f"{name} - {duration} - ৳{price}", callback_data=f"proxy:{i}"
             )
         ])
     buttons.append([InlineKeyboardButton("📢 Community Channel", url=CHANNEL_LINK)])
@@ -316,10 +375,9 @@ async def menu_buy_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_buy_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.message.from_user)
     await update.message.reply_text(
-        "🌐 Proxy প্যাকেজ এখনো এই বটে যোগ করা হয়নি।\n\n"
-        "Proxy কিনতে চাইলে সরাসরি Support-এ মেসেজ করুন:\n"
-        f"👉 {ORDER_LINK}"
+        "🌐 Proxy প্যাকেজসমূহ:", reply_markup=proxy_keyboard()
     )
 
 
@@ -337,6 +395,7 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
     context.user_data["state"] = WAITING_DEPOSIT_AMOUNT
     context.user_data.pop("package", None)
+    context.user_data.pop("proxy", None)
     context.user_data.pop("deposit_amount", None)
     await update.message.reply_text(
         "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
@@ -464,6 +523,107 @@ async def back_to_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await query.edit_message_text(
         "📦 VPN প্যাকেজসমূহ:", reply_markup=package_keyboard()
+    )
+
+
+# ---------------- Proxy / buy with balance ----------------
+
+async def proxy_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ensure_user(query.from_user)
+    index = int(query.data.split(":")[1])
+    name, duration, price = PROXIES[index]
+    balance = get_balance(query.from_user.id)
+    context.user_data["proxy"] = (name, duration, price)
+    text = (
+        f"✅ আপনি বেছেছেন: {name} - {duration}\n"
+        f"💰 দাম: ৳{price}\n"
+        f"💳 আপনার ব্যালেন্স: ৳{balance}\n\n"
+        "কীভাবে কিনতে চান, বেছে নিন:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💳 Balance দিয়ে কিনুন (৳{price})",
+            callback_data=f"proxpaybal:{index}",
+        )],
+        [InlineKeyboardButton(
+            "💵 বিকাশ / নগদ দিয়ে কিনুন",
+            callback_data=f"proxpaycash:{index}",
+        )],
+        [InlineKeyboardButton("⬅️ Proxy লিস্টে ফিরুন", callback_data="proxyback")],
+    ])
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    ensure_user(user)
+    index = int(query.data.split(":")[1])
+    name, duration, price = PROXIES[index]
+    if not ADMIN_ID:
+        await query.answer("এখন অর্ডার নেওয়া যাচ্ছে না।", show_alert=True)
+        await query.edit_message_text(
+            "দুঃখিত, এখন অর্ডার নেওয়া যাচ্ছে না। সরাসরি এখানে মেসেজ করুন:\n"
+            f"👉 {ORDER_LINK}"
+        )
+        return
+    balance = get_balance(user.id)
+    if balance < price:
+        await query.answer(
+            f"ব্যালেন্স কম! আপনার ব্যালেন্স ৳{balance}, দরকার ৳{price}। "
+            "আগে Deposit করুন।",
+            show_alert=True,
+        )
+        return
+    new_balance = add_balance(user.id, -price)
+    caption = (
+        "🛒 নতুন Proxy অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
+        f"🌐 প্যাকেজ: {name} - {duration}\n"
+        f"💰 দাম: ৳{price}\n"
+        f"👤 কাস্টমার: {customer_label(user)}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"💳 বাকি ব্যালেন্স: ৳{new_balance}"
+    )
+    await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+    context.user_data.clear()
+    await query.answer("অর্ডার সম্পন্ন!")
+    await query.edit_message_text(
+        f"✅ অর্ডার সম্পন্ন! {name} - {duration} এর ৳{price} "
+        f"আপনার ব্যালেন্স থেকে কাটা হয়েছে।\n"
+        f"💳 বাকি ব্যালেন্স: ৳{new_balance}\n\n"
+        "অ্যাডমিন যত দ্রুত সম্ভব আপনার Proxy details পাঠিয়ে দেবে।"
+    )
+
+
+async def pay_proxy_with_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = int(query.data.split(":")[1])
+    name, duration, price = PROXIES[index]
+    context.user_data["proxy"] = (name, duration, price)
+    context.user_data["state"] = WAITING_PROXY_PAYMENT
+    text = (
+        f"✅ আপনি বেছেছেন: {name} - {duration}\n"
+        f"💰 দাম: ৳{price}\n\n"
+        f"💳 পেমেন্ট করুন:\n"
+        f"বিকাশ / নগদ: {PAYMENT_NUMBER}\n\n"
+        "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।\n"
+        "আমরা যাচাই করে আপনার Proxy details পাঠিয়ে দেবো।"
+    )
+    back = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Proxy লিস্টে ফিরুন", callback_data="proxyback")],
+    ])
+    await query.edit_message_text(text, reply_markup=back)
+
+
+async def back_to_proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text(
+        "🌐 Proxy প্যাকেজসমূহ:", reply_markup=proxy_keyboard()
     )
 
 
@@ -671,6 +831,41 @@ async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {target_id}-কে পাঠানো হয়েছে।")
 
 
+async def sendproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "ব্যবহার: /sendproxy <user_id> <Proxy details>\n"
+            "যেমন: /sendproxy 123456789 host: x.x.x.x port: 8080 username: abc password: xyz"
+        )
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID সংখ্যায় লিখতে হবে। যেমন: /sendproxy 123456789 host: x.x.x.x")
+        return
+    details = " ".join(context.args[1:]).strip()
+    if not details:
+        await update.message.reply_text("Proxy details লিখতে হবে।")
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎉 আপনার Proxy রেডি!\n\n{details}\n\n"
+            f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}",
+        )
+    except Exception as exc:
+        logger.warning("Proxy pathate parini %s: %s", target_id, exc)
+        await update.message.reply_text(
+            f"❌ User {target_id}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+        )
+        return
+    await update.message.reply_text(f"✅ Proxy details User {target_id}-কে পাঠানো হয়েছে।")
+
+
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     if not is_admin(user.id):
@@ -678,6 +873,32 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     count = get_user_count()
     await update.message.reply_text(f"👥 মোট বট ইউজার: {count} জন\n(এরা সবাই বটে /start করেছে।)")
+
+
+async def away_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    if context.args and context.args[0].lower() in ("on", "off"):
+        mode = context.args[0].lower()
+        set_setting("away", mode)
+        if mode == "on":
+            await update.message.reply_text(
+                "✅ Away mode ON হয়েছে। এখন থেকে কাস্টমার ফ্রি-টেক্সট লিখলে "
+                "অফলাইন মেসেজ পাবে।"
+            )
+        else:
+            await update.message.reply_text(
+                "✅ Away mode OFF হয়েছে। কাস্টমার আবার আগের মতো মেনু গাইড পাবে।"
+            )
+        return
+    current = get_setting("away", "off")
+    await update.message.reply_text(
+        f"Away mode এখন: {current.upper()}\n"
+        "চালু করতে: /away on\n"
+        "বন্ধ করতে: /away off"
+    )
 
 
 # ---------------- Text / photo input ----------------
@@ -763,12 +984,58 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    # Cash-e Proxy kenar proman (manual jachai)
+    proxy = context.user_data.get("proxy")
+    if state == WAITING_PROXY_PAYMENT and proxy:
+        if not ADMIN_ID:
+            logger.warning("ADMIN_ID set kora nei, tai proxy order forward kora jayni.")
+            await update.message.reply_text(
+                "দুঃখিত, এখন অর্ডার নেওয়া যাচ্ছে না। সরাসরি এখানে মেসেজ করুন:\n"
+                f"👉 {ORDER_LINK}"
+            )
+            return
+        pname, pduration, pprice = proxy
+        pcaption = (
+            "🛒 নতুন Proxy অর্ডার!\n"
+            f"🌐 প্যাকেজ: {pname} - {pduration}\n"
+            f"💰 দাম: ৳{pprice}\n"
+            f"👤 কাস্টমার: {customer_label(user)}\n"
+            f"🆔 User ID: {user.id}"
+        )
+        if update.message.photo:
+            photo_id = update.message.photo[-1].file_id
+            text = update.message.caption or ""
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=photo_id,
+                caption=pcaption + (f"\n📝 মেসেজ: {text}" if text else ""),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=pcaption + f"\n📝 TrxID / মেসেজ: {update.message.text}",
+            )
+        context.user_data.clear()
+        await update.message.reply_text(
+            "✅ অর্ডার পৌঁছেছে! আমরা পেমেন্ট যাচাই করে যত দ্রুত সম্ভব "
+            "আপনার Proxy details পাঠিয়ে দেবো।"
+        )
+        return
+
     # Cash-e VPN kenar proman (ager moto, manual jachai)
     if state != WAITING_PAYMENT or not package:
-        await update.message.reply_text(
-            "নিচের মেনু থেকে Buy VPN চাপ দিয়ে একটি প্যাকেজ বেছে নিন, "
-            "তারপর TrxID বা স্ক্রিনশট পাঠান।"
-        )
+        if get_setting("away", "off") == "on":
+            await update.message.reply_text(
+                "⏳ শাদিন ভাই এখন অফলাইন আছেন। অনলাইন আসলে আপনার "
+                "মেসেজের রিপ্লাই দেবেন।\n\n"
+                "জরুরি হলে Support-এ মেসেজ করুন:\n"
+                f"👉 {ORDER_LINK}"
+            )
+        else:
+            await update.message.reply_text(
+                "নিচের মেনু থেকে Buy VPN চাপ দিয়ে একটি প্যাকেজ বেছে নিন, "
+                "তারপর TrxID বা স্ক্রিনশট পাঠান।"
+            )
         return
 
     name, duration, price = package
@@ -819,7 +1086,9 @@ def main():
     app.add_handler(CommandHandler("exportbalances", exportbalances_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("sendvpn", sendvpn_command))
+    app.add_handler(CommandHandler("sendproxy", sendproxy_command))
     app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("away", away_command))
     app.add_handler(MessageHandler(filters.Regex("Buy VPN"), menu_buy_vpn))
     app.add_handler(MessageHandler(filters.Regex("Buy Proxy"), menu_buy_proxy))
     app.add_handler(MessageHandler(filters.Regex("Balance"), menu_balance))
@@ -830,6 +1099,10 @@ def main():
     app.add_handler(CallbackQueryHandler(pay_with_balance, pattern=r"^paybal:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_cash, pattern=r"^paycash:\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_list, pattern=r"^back$"))
+    app.add_handler(CallbackQueryHandler(proxy_selected, pattern=r"^proxy:\d+$"))
+    app.add_handler(CallbackQueryHandler(pay_proxy_with_balance, pattern=r"^proxpaybal:\d+$"))
+    app.add_handler(CallbackQueryHandler(pay_proxy_with_cash, pattern=r"^proxpaycash:\d+$"))
+    app.add_handler(CallbackQueryHandler(back_to_proxy_list, pattern=r"^proxyback$"))
     app.add_handler(CallbackQueryHandler(approve_deposit, pattern=r"^dep_approve:\d+$"))
     app.add_handler(CallbackQueryHandler(reject_deposit, pattern=r"^dep_reject:\d+$"))
     app.add_handler(
