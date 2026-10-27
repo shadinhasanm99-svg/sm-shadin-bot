@@ -133,12 +133,14 @@ WAITING_PAYMENT = "waiting_payment"
 WAITING_PROXY_PAYMENT = "waiting_proxy_payment"
 WAITING_DEPOSIT_AMOUNT = "waiting_deposit_amount"
 WAITING_DEPOSIT_PROOF = "waiting_deposit_proof"
+WAITING_SUPPORT = "waiting_support"
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🛒 Buy VPN"), KeyboardButton("🌐 Buy Proxy")],
         [KeyboardButton("💳 Balance"), KeyboardButton("💰 Deposit")],
         [KeyboardButton("🔗 Referral"), KeyboardButton("🎧 Support")],
+        [KeyboardButton("📦 আমার অর্ডার")],
     ],
     resize_keyboard=True,
 )
@@ -195,6 +197,27 @@ def init_db():
         "amount INTEGER, "
         "used INTEGER NOT NULL DEFAULT 0, "
         "received_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    # Referral + orders: purono DB-teo column/table na thakle jog hobe.
+    _cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    for _col, _ddl in (
+        ("referred_by", "INTEGER"),
+        ("ref_orders_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("ref_bonus_paid", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if _col not in _cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_ddl}")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS orders ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER, "
+        "kind TEXT, "
+        "name TEXT, "
+        "duration TEXT, "
+        "price INTEGER, "
+        "pay_method TEXT, "
+        "status TEXT DEFAULT 'done', "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
     )
     conn.commit()
     conn.close()
@@ -317,6 +340,105 @@ def add_balance(user_id, amount):
     conn.commit()
     conn.close()
     return row[0] if row else 0
+
+
+def set_referrer(user_id, referrer_id):
+    """Notun user referral link diye asle, sudhu prothombar referrer set korun."""
+    try:
+        referrer_id = int(referrer_id)
+    except (TypeError, ValueError):
+        return
+    if referrer_id == user_id:
+        return
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)",
+        (referrer_id,),
+    )
+    conn.execute(
+        "UPDATE users SET referred_by = ? WHERE user_id = ? AND referred_by IS NULL",
+        (referrer_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_referral_stats(user_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)
+    ).fetchone()
+    referred_count = row[0] if row else 0
+    row = conn.execute(
+        "SELECT ref_orders_total, ref_bonus_paid FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    total_orders = row[0] if row else 0
+    bonus_paid = row[1] if row else 0
+    return referred_count, total_orders, bonus_paid
+
+
+def record_referral_order(buyer_id):
+    """Balance order hole referrer-er count baran. 10 order porpor ৳5 bonus due hole True."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT referred_by FROM users WHERE user_id = ?", (buyer_id,)
+    ).fetchone()
+    if not row or not row[0]:
+        conn.close()
+        return None
+    referrer_id = row[0]
+    conn.execute(
+        "UPDATE users SET ref_orders_total = ref_orders_total + 1 WHERE user_id = ?",
+        (referrer_id,),
+    )
+    row = conn.execute(
+        "SELECT ref_orders_total FROM users WHERE user_id = ?", (referrer_id,)
+    ).fetchone()
+    total = row[0] if row else 0
+    bonus_due = (total > 0 and total % 10 == 0)
+    if bonus_due:
+        conn.execute(
+            "UPDATE users SET ref_bonus_paid = ref_bonus_paid + 1 WHERE user_id = ?",
+            (referrer_id,),
+        )
+    conn.commit()
+    conn.close()
+    return (referrer_id, total, bonus_due)
+
+
+def record_order(user_id, kind, name, duration, price, pay_method, status="done"):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO orders (user_id, kind, name, duration, price, pay_method, status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, kind, name, duration, price, pay_method, status),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_orders(user_id, limit=10):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT kind, name, duration, price, pay_method, status, created_at"
+        " FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_deposits(user_id, limit=5):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT amount, trxid, status, created_at FROM deposits"
+        " WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def create_deposit(user_id, username, amount, trxid):
@@ -515,6 +637,8 @@ def customer_label(user):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if context.args and context.args[0].isdigit():
+        set_referrer(update.message.from_user.id, context.args[0])
     context.user_data.clear()
     await update.message.reply_text(welcome_text(), reply_markup=MAIN_MENU)
 
@@ -525,8 +649,11 @@ async def packages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.message.from_user)
+    context.user_data["state"] = WAITING_SUPPORT
     await update.message.reply_text(
-        "💬 কোনো সমস্যা বা প্রশ্ন থাকলে সরাসরি মেসেজ করুন:\n"
+        "🎧 Support: আপনার সমস্যা বা প্রশ্ন এখানে লিখে পাঠান, অ্যাডমিন বট থেকেই উত্তর দেবে।\n\n"
+        "সরাসরি মেসেজ করতে চাইলে:\n"
         f"👉 {ORDER_LINK}\n\n"
         f"📢 Community Channel: {CHANNEL_LINK}"
     )
@@ -564,27 +691,60 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("deposit_amount", None)
     await update.message.reply_text(
         "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
-        "Minimum deposit ৳20।\n"
-        "যেমন: 100\n\n"
+        "Minimum deposit ৳20।\n\n"
         f"টাকা পাঠাবেন এই নম্বরে:\nবিকাশ / নগদ: {PAYMENT_NUMBER}"
     )
 
 
 async def menu_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
+    ensure_user(user)
     link = f"https://t.me/{BOT_USERNAME}?start={user.id}"
+    referred_count, total_orders, bonus_paid = get_referral_stats(user.id)
+    progress = total_orders % 10
+    remaining = 10 - progress if progress else 10
+    if total_orders == 0:
+        remaining = 10
     await update.message.reply_text(
         "🔗 আপনার Referral লিংক:\n"
         f"{link}\n\n"
-        "এই লিংক দিয়ে বন্ধুদের বটে আনুন। "
-        "Referral বোনাসের ব্যাপারে Support-এ মেসেজ করে জেনে নিন:\n"
-        f"👉 {ORDER_LINK}"
+        f"👥 আপনি রেফার করেছেন: {referred_count} জন\n"
+        f"🛒 তাদের মোট অর্ডার: {total_orders} টা\n"
+        f"🎁 বোনাস পেয়েছেন: ৳{bonus_paid * 5}\n"
+        f"⏳ পরের ৳5 বোনাসের জন্য আরো {remaining} টা অর্ডার লাগবে\n\n"
+        "নিয়ম: আপনার লিংক দিয়ে আসা বন্ধুরা মোট 10 টা Balance অর্ডার করলেই "
+        "আপনি ৳5 বোনাস পাবেন, প্রতি 10 অর্ডারে আবার ৳5।"
     )
 
 
+async def menu_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    ensure_user(user)
+    orders = get_user_orders(user.id, 10)
+    deposits = get_user_deposits(user.id, 5)
+    if not orders and not deposits:
+        await update.message.reply_text(
+            "📦 আপনার এখনো কোনো অর্ডার বা Deposit নেই।\n"
+            "Buy VPN বা Buy Proxy থেকে প্রথম অর্ডার করুন।"
+        )
+        return
+    lines = ["📦 আপনার শেষ অর্ডার:"]
+    for kind, name, duration, price, pay_method, status, created_at in orders:
+        lines.append(f"• {kind}: {name} - {duration} - ৳{price} ({status})")
+    if deposits:
+        lines.append("\n💰 শেষ Deposit:")
+        for amount, trxid, status, created_at in deposits:
+            lines.append(f"• ৳{amount} - {status}")
+    lines.append(f"\n💳 বর্তমান ব্যালেন্স: ৳{get_balance(user.id)}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def menu_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.message.from_user)
+    context.user_data["state"] = WAITING_SUPPORT
     await update.message.reply_text(
-        "🎧 Support:\n"
+        "🎧 Support: আপনার সমস্যা বা প্রশ্ন এখানে লিখে পাঠান, অ্যাডমিন বট থেকেই উত্তর দেবে।\n\n"
+        "সরাসরি মেসেজ করতে চাইলে:\n"
         f"👉 {ORDER_LINK}\n\n"
         f"📢 Community Channel: {CHANNEL_LINK}"
     )
@@ -642,6 +802,8 @@ async def pay_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     new_balance = add_balance(user.id, -price)
+    record_order(user.id, "VPN", name, duration, price, "balance", "done")
+    _ref = record_referral_order(user.id)
     caption = (
         "🛒 নতুন অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"📦 প্যাকেজ: {name} - {duration}\n"
@@ -651,6 +813,17 @@ async def pay_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 বাকি ব্যালেন্স: ৳{new_balance}"
     )
     await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+    if _ref and _ref[2]:
+        _ref_id, _ref_total, _ = _ref
+        add_balance(_ref_id, 5)
+        try:
+            await context.bot.send_message(
+                chat_id=_ref_id,
+                text="🎁 Referral বোনাস! আপনার রেফার করা বন্ধুদের মোট অর্ডার "
+                f"{_ref_total} টা হয়েছে, তাই আপনার ব্যালেন্সে ৳5 যোগ হয়েছে।",
+            )
+        except Exception as exc:
+            logger.warning("Referral bonus janate parini: %s", exc)
     context.user_data.clear()
     await query.answer("অর্ডার সম্পন্ন!")
     await query.edit_message_text(
@@ -743,6 +916,8 @@ async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     new_balance = add_balance(user.id, -price)
+    record_order(user.id, "Proxy", name, duration, price, "balance", "done")
+    _ref = record_referral_order(user.id)
     caption = (
         "🛒 নতুন Proxy অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"🌐 প্যাকেজ: {name} - {duration}\n"
@@ -752,6 +927,17 @@ async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_T
         f"💳 বাকি ব্যালেন্স: ৳{new_balance}"
     )
     await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+    if _ref and _ref[2]:
+        _ref_id, _ref_total, _ = _ref
+        add_balance(_ref_id, 5)
+        try:
+            await context.bot.send_message(
+                chat_id=_ref_id,
+                text="🎁 Referral বোনাস! আপনার রেফার করা বন্ধুদের মোট অর্ডার "
+                f"{_ref_total} টা হয়েছে, তাই আপনার ব্যালেন্সে ৳5 যোগ হয়েছে।",
+            )
+        except Exception as exc:
+            logger.warning("Referral bonus janate parini: %s", exc)
     context.user_data.clear()
     await query.answer("অর্ডার সম্পন্ন!")
     await query.edit_message_text(
@@ -1040,6 +1226,64 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 মোট বট ইউজার: {count} জন\n(এরা সবাই বটে /start করেছে।)")
 
 
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /reply <user_id> <message> — Support-এ আসা কাস্টমারকে বট থেকে উত্তর।"""
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "ব্যবহার: /reply <user_id> <মেসেজ>\nযেমন: /reply 123456789 আপনার VPN রেডি!"
+        )
+        return
+    target_id = int(context.args[0])
+    text = " ".join(context.args[1:])
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎧 Support থেকে উত্তর:\n{text}",
+        )
+        await update.message.reply_text(f"✅ {target_id}-কে উত্তর পাঠানো হয়েছে।")
+    except Exception as exc:
+        logger.warning("Reply pathate parini: %s", exc)
+        await update.message.reply_text(
+            "❌ ওই ইউজারকে মেসেজ পাঠানো যায়নি। হয়তো সে বট /start করেনি।"
+        )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    conn = get_conn()
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_balance = conn.execute("SELECT COALESCE(SUM(balance), 0) FROM users").fetchone()[0]
+    total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    order_total = conn.execute(
+        "SELECT COALESCE(SUM(price), 0) FROM orders WHERE status = 'done'"
+    ).fetchone()[0]
+    dep_count = conn.execute(
+        "SELECT COUNT(*) FROM deposits WHERE status IN ('approved', 'auto_approved')"
+    ).fetchone()[0]
+    dep_total = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM deposits WHERE status IN ('approved', 'auto_approved')"
+    ).fetchone()[0]
+    ref_users = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL"
+    ).fetchone()[0]
+    conn.close()
+    await update.message.reply_text(
+        "📊 SM SHADIN Stats:\n"
+        f"👥 মোট ইউজার: {total_users} জন\n"
+        f"💳 ইউজারদের মোট ব্যালেন্স: ৳{total_balance}\n"
+        f"🛒 মোট অর্ডার: {total_orders} টা (৳{order_total})\n"
+        f"💰 Approve হওয়া Deposit: {dep_count} টা (৳{dep_total})\n"
+        f"🔗 Referral দিয়ে আসা ইউজার: {ref_users} জন"
+    )
+
+
 async def away_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     if not is_admin(user.id):
@@ -1066,6 +1310,89 @@ async def away_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------- Auto reply (preset, keyword based) ----------------
+# Admin-er manual reply charai customer-er sadharon proshner uttor dey.
+# Kono keyword na mille ager away/menu-guide logic cholbe.
+
+def auto_reply_text(text):
+    if not text:
+        return None
+    t = text.lower()
+    if any(k in t for k in ("deposit", "ডিপোজিট", "জমা")):
+        return (
+            "💰 Deposit করতে Deposit বোতাম চাপুন, তারপর টাকার পরিমাণ লিখুন।\n"
+            "Minimum deposit ৳20।\n"
+            f"বিকাশ / নগদ Send Money করুন: {PAYMENT_NUMBER}\n\n"
+            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
+            "ধন্যবাদ।"
+        )
+    if any(k in t for k in ("payment", "bkash", "nagad", "বিকাশ", "নগদ", "পেমেন্ট", "টাকা পাঠ")):
+        return (
+            "💳 পেমেন্ট করুন:\n"
+            f"বিকাশ / নগদ Send Money: {PAYMENT_NUMBER}\n\n"
+            "টাকা পাঠানোর পর TrxID এখানে লিখে পাঠান।\n"
+            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।"
+        )
+    if any(k in t for k in ("proxy", "প্রক্সি")):
+        return (
+            "🌐 Proxy প্যাকেজ:\n"
+            "10 IP (9Proxy) ৳59, 100 MB (9Proxy) ৳25, 200 MB (9Proxy) ৳35,\n"
+            "100 MB (RapidProxy) ৳25, 200 MB (RapidProxy) ৳35,\n"
+            "100 MB (711Proxy) ৳25, 200 MB (711Proxy) ৳35,\n"
+            "100 MB (H143Proxy) ৳19, 200 MB (H143Proxy) ৳23\n\n"
+            "কিনতে নিচের মেনু থেকে Buy Proxy চাপুন।"
+        )
+    if any(k in t for k in ("price", "dam", "দাম", "প্রাইস", "package", "প্যাকেজ", "list", "লিস্ট")):
+        return (
+            "📦 VPN প্যাকেজ:\n"
+            "Nord 7 দিন ৳25, Express 3 দিন ৳20, CyberGhost 3 দিন ৳20, PIA 3 দিন ৳20,\n"
+            "Surfshark 7 দিন ৳25, IPVanish 7 দিন ৳25, HMA 7 দিন ৳25,\n"
+            "Proton 14 দিন ৳50, Nord 30 দিন ৳110, HMA 30 দিন ৳50\n\n"
+            "কিনতে নিচের মেনু থেকে Buy VPN চাপুন।"
+        )
+    if any(k in t for k in ("kinbo", "kinte", "kivabe", "কিনবো", "কিনতে", "কিভাবে", "কেমনে", "order", "অর্ডার")):
+        return (
+            "🛒 কিভাবে কিনবেন:\n"
+            "১. নিচের মেনু থেকে Buy VPN বা Buy Proxy চাপুন\n"
+            "২. প্যাকেজ বেছে নিন\n"
+            "৩. Balance দিয়ে কিনুন, অথবা বিকাশ / নগদে টাকা পাঠিয়ে TrxID পাঠান\n"
+            "৪. পেমেন্ট যাচাই হলে অ্যাকাউন্ট পাঠিয়ে দেওয়া হবে"
+        )
+    if any(k in t for k in ("kobe", "kখন", "কবে", "কখন", "delivery", "ডেলিভারি", "account", "অ্যাকাউন্ট", "পাবো")):
+        return (
+            "⏳ পেমেন্ট যাচাই হলে যত দ্রুত সম্ভব আপনার VPN / Proxy অ্যাকাউন্ট পাঠিয়ে দেওয়া হবে।\n"
+            "দেরি হলে Support-এ মেসেজ করুন।"
+        )
+    if any(k in t for k in ("balance", "ব্যালেন্স")):
+        return (
+            "💳 আপনার ব্যালেন্স দেখতে নিচের মেনু থেকে Balance চাপুন।\n"
+            "ব্যালেন্স বাড়াতে Deposit চাপুন। Minimum deposit ৳20।"
+        )
+    if any(k in t for k in ("support", "help", "সমস্যা", "problem", "kotha", "কথা")):
+        return (
+            "🎧 Support-এর জন্য এখানে মেসেজ করুন:\n"
+            f"👉 {ORDER_LINK}\n"
+            "অথবা কমিউনিটি চ্যানেল: https://t.me/socialmarketing22"
+        )
+    if any(k in t for k in ("referral", "রেফার", "invite", "ইনভাইট")):
+        return (
+            "🔗 Referral লিংক আর আপনার রেফার কাউন্ট দেখতে নিচের মেনু থেকে Referral চাপুন।\n"
+            "নিয়ম: আপনার লিংক দিয়ে আসা বন্ধুদের মোট 10 টা Balance অর্ডার হলে আপনি ৳5 বোনাস পাবেন।"
+        )
+    if any(k in t for k in ("meyad", "মেয়াদ", "expiry", "শেষ", "sesh")):
+        return (
+            "📅 প্যাকেজের মেয়াদ শেষ হলে আবার নতুন করে একই প্যাকেজ কিনতে হবে।\n"
+            "মেয়াদ শেষ হওয়ার আগেই নতুন প্যাকেজ কিনে রাখতে পারেন।"
+        )
+    if any(k in t for k in ("hi", "hello", "salam", "সালাম", "হাই", "আসসালামু")):
+        return (
+            "👋 আসসালামু আলাইকুম! SM SHADIN Shop-এ স্বাগতম।\n"
+            "নিচের মেনু থেকে Buy VPN চাপ দিয়ে প্যাকেজ বেছে নিন, "
+            "অথবা দাম লিখলে প্যাকেজের দাম দেখতে পাবেন।"
+        )
+    return None
+
+
 # ---------------- Text / photo input ----------------
 
 async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1074,11 +1401,51 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.message.from_user
     ensure_user(user)
 
+    # Support: Support button chaple porer message admin-er kache jabe.
+    if state == WAITING_SUPPORT:
+        if not ADMIN_ID:
+            await update.message.reply_text(
+                "দুঃখিত, এখন Support মেসেজ পাঠানো যাচ্ছে না। সরাসরি এখানে মেসেজ করুন:\n"
+                f"👉 {ORDER_LINK}"
+            )
+            context.user_data.clear()
+            return
+        if update.message.photo:
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=update.message.photo[-1].file_id,
+                caption=(
+                    "🎧 নতুন Support মেসেজ!\n"
+                    f"👤 কাস্টমার: {customer_label(user)}\n"
+                    f"🆔 User ID: {user.id}\n"
+                    f"📝 মেসেজ: {update.message.caption or ''}\n"
+                    "উত্তর দিতে: /reply "
+                    f"{user.id} <আপনার মেসেজ>"
+                ),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🎧 নতুন Support মেসেজ!\n"
+                    f"👤 কাস্টমার: {customer_label(user)}\n"
+                    f"🆔 User ID: {user.id}\n"
+                    f"📝 মেসেজ: {update.message.text}\n"
+                    "উত্তর দিতে: /reply "
+                    f"{user.id} <আপনার মেসেজ>"
+                ),
+            )
+        context.user_data.clear()
+        await update.message.reply_text(
+            "✅ আপনার মেসেজ অ্যাডমিনের কাছে পৌঁছেছে! অ্যাডমিন বট থেকেই উত্তর দেবে।"
+        )
+        return
+
     # Step 1: Deposit-er taka-r poriman
     if state == WAITING_DEPOSIT_AMOUNT:
         if update.message.photo:
             await update.message.reply_text(
-                "আগে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন। যেমন: 100"
+                "আগে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।"
             )
             return
         raw = (update.message.text or "").strip().replace("৳", "").replace(",", "")
@@ -1086,20 +1453,19 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             amount = int(raw)
         except ValueError:
             await update.message.reply_text(
-                "শুধু সংখ্যাটা লিখুন। যেমন: 100"
+                "শুধু সংখ্যাটা লিখুন।"
             )
             return
         if amount < 20:
-            await update.message.reply_text("Minimum deposit ৳20। 20 বা তার বেশি লিখুন। যেমন: 100")
+            await update.message.reply_text("Minimum deposit ৳20। 20 বা তার বেশি লিখুন।")
             return
         context.user_data["deposit_amount"] = amount
         context.user_data["state"] = WAITING_DEPOSIT_PROOF
         await update.message.reply_text(
-            f"💰 ৳{amount} Deposit-এর জন্য নিচের নম্বরে টাকা পাঠান:\n"
-            f"বিকাশ / নগদ: {PAYMENT_NUMBER}\n\n"
-            "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।\n"
-            "TrxID আর টাকা SMS-এর সাথে মিললে ব্যালেন্স অটো যোগ হবে, "
-            "অ্যাডমিনের Approve লাগবে না।"
+            f"💰 ৳{amount} Deposit করুন:\n"
+            f"বিকাশ / নগদ Send Money করুন: {PAYMENT_NUMBER}\n\n"
+            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
+            "ধন্যবাদ।"
         )
         return
 
@@ -1226,6 +1592,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=ADMIN_ID,
                 text=pcaption + f"\n📝 TrxID / মেসেজ: {update.message.text}",
             )
+        record_order(user.id, "Proxy", pname, pduration, pprice, "cash", "pending")
         context.user_data.clear()
         await update.message.reply_text(
             "✅ অর্ডার পৌঁছেছে! আমরা পেমেন্ট যাচাই করে যত দ্রুত সম্ভব "
@@ -1235,6 +1602,13 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Cash-e VPN kenar proman (ager moto, manual jachai)
     if state != WAITING_PAYMENT or not package:
+        # Age preset auto-reply check: keyword mille preset uttor, state clear hobe na
+        # jate customer tarporo TrxID / order pathate pare.
+        if update.message.text:
+            _auto = auto_reply_text(update.message.text)
+            if _auto:
+                await update.message.reply_text(_auto)
+                return
         if get_setting("away", "off") == "on":
             await update.message.reply_text(
                 "⏳ শাদিন ভাই এখন অফলাইন আছেন। অনলাইন আসলে আপনার "
@@ -1277,6 +1651,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             chat_id=ADMIN_ID,
             text=caption + f"\n📝 TrxID / মেসেজ: {update.message.text}",
         )
+    record_order(user.id, "VPN", name, duration, price, "cash", "pending")
     context.user_data.clear()
     await update.message.reply_text(
         "✅ অর্ডার পৌঁছেছে! আমরা পেমেন্ট যাচাই করে যত দ্রুত সম্ভব "
@@ -1300,12 +1675,15 @@ def main():
     app.add_handler(CommandHandler("sendproxy", sendproxy_command))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("away", away_command))
+    app.add_handler(CommandHandler("reply", reply_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.Regex("Buy VPN"), menu_buy_vpn))
     app.add_handler(MessageHandler(filters.Regex("Buy Proxy"), menu_buy_proxy))
     app.add_handler(MessageHandler(filters.Regex("Balance"), menu_balance))
     app.add_handler(MessageHandler(filters.Regex("Deposit"), menu_deposit))
     app.add_handler(MessageHandler(filters.Regex("Referral"), menu_referral))
     app.add_handler(MessageHandler(filters.Regex("Support"), menu_support))
+    app.add_handler(MessageHandler(filters.Regex("আমার অর্ডার"), menu_my_orders))
     app.add_handler(CallbackQueryHandler(package_selected, pattern=r"^pkg:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_balance, pattern=r"^paybal:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_cash, pattern=r"^paycash:\d+$"))
