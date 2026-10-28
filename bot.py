@@ -133,6 +133,8 @@ PROXIES = [
     ("200 MB (711Proxy)", "LT", 35),
     ("100 MB (H143Proxy)", "LT", 19),
     ("200 MB (H143Proxy)", "LT", 23),
+    ("200 MB (H143Proxy)", "LT", 23666),
+]
 ]
 
 WAITING_PAYMENT = "waiting_payment"
