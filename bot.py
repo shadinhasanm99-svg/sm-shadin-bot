@@ -98,6 +98,12 @@ BOT_USERNAME = "sm_shadin_shop_bot"
 PAYMENT_NUMBER = "01879173170"
 ORDER_LINK = "https://t.me/BestservicSM"
 CHANNEL_LINK = "https://t.me/socialmarketing22"
+# Force-join channel (2026-10-28, user-er deoa channel):
+# Bot-e dhukar age ei channel-e join korte hobe, tarpor Verify Access.
+# BOT KE EI CHANNEL-E ADMIN BANATE HOBE, na hole Telegram bot-ke
+# getChatMember diye join check korte dibe na, ar sob user atke jabe.
+FORCE_JOIN_CHANNEL = "@smshadinproxy"
+FORCE_JOIN_LINK = "https://t.me/smshadinproxy"
 
 # (VPN name, duration, price in BDT)
 PACKAGES = [
@@ -633,6 +639,91 @@ def customer_label(user):
     return user.full_name
 
 
+# ---------------- Force join (channel join + Verify Access) ----------------
+
+async def is_channel_member(bot, user_id):
+    """True = joined, False = not joined, None = check kora jayni (bot admin na / channel vul)."""
+    try:
+        member = await bot.get_chat_member(chat_id=FORCE_JOIN_CHANNEL, user_id=user_id)
+        return member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        logger.warning(f"Force-join check failed for {user_id}: {e}")
+        return None
+
+
+def force_join_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Now", url=FORCE_JOIN_LINK)],
+        [InlineKeyboardButton("Verify Access", callback_data="verify_join")],
+    ])
+
+
+def force_join_text():
+    # Screenshot-er lekha hubuhu, shobdo bodlano hoyni.
+    # VIP badge-ta Telegram-er custom icon, text hisebe copy kora jay na,
+    # tai header-e shudhu lekha-tai rakha hoyeche. Channel-er link
+    # Join Now button-e ache, message-er modhye alada link deoa hoyni,
+    # screenshot-eo message-er modhye link chilo na.
+    return (
+        "<b>ACCESS RESTRICTED</b>\n"
+        "—————————————————\n\n"
+        "👥 প্রিয় ইউজার, আমাদের বটের সম্পূর্ণ সার্ভিস এবং সিকিউর ট্রানজেকশন "
+        "উপভোগ করতে আমাদের অফিসিয়াল কমিউনিটিতে যুক্ত হওয়া বাধ্যতামূলক।\n\n"
+        "<b>📢 নিচের চ্যানেলগুলোতে জয়েন করে আপনার এক্সেস আনলক করুন:</b>\n\n"
+        "—————————————————\n\n"
+        "📌 জয়েন করা সম্পন্ন হলে নিচের '<b><u>Verify Access</u></b>' বাটনে ক্লিক করুন।"
+    )
+
+
+async def check_force_join(message, bot, user_id):
+    """Menu/message handler-er jonno: allowed hole True, gate dekhale False."""
+    if is_admin(user_id):
+        return True
+    member = await is_channel_member(bot, user_id)
+    if member is True:
+        return True
+    if member is None:
+        await message.reply_text(
+            "⚠️ ভেরিফাই চেক করা যাচ্ছে না। বটকে চ্যানেলে অ্যাডমিন করা আছে কিনা দেখুন।\n"
+            f"চ্যানেল: {FORCE_JOIN_LINK}\n"
+            f"সরাসরি যোগাযোগ: {ORDER_LINK}"
+        )
+        return False
+    await message.reply_text(force_join_text(), reply_markup=force_join_keyboard(), parse_mode="HTML")
+    return False
+
+
+async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if is_admin(user_id):
+        await query.message.reply_text(welcome_text(), reply_markup=MAIN_MENU)
+        return
+    member = await is_channel_member(context.bot, user_id)
+    if member is True:
+        await query.message.reply_text(
+            "✅ ভেরিফাই সফল! আপনি চ্যানেলে জয়েন করেছেন।\n\n" + welcome_text(),
+            reply_markup=MAIN_MENU,
+        )
+    elif member is None:
+        await query.message.reply_text(
+            "⚠️ ভেরিফাই চেক করা যাচ্ছে না। বটকে চ্যানেলে অ্যাডমিন করা আছে কিনা দেখুন।\n"
+            f"চ্যানেল: {FORCE_JOIN_LINK}\n"
+            f"সরাসরি যোগাযোগ: {ORDER_LINK}"
+        )
+    else:
+        await query.answer(
+            "❌ আপনি এখনো জয়েন করেননি। প্রথমে Join Now দিয়ে চ্যানেলে জয়েন করুন, তারপর Verify Access চাপুন।",
+            show_alert=True,
+        )
+        await query.message.reply_text(
+            "❌ আপনি এখনো জয়েন করেননি।\n"
+            "প্রথমে Join Now দিয়ে চ্যানেলে জয়েন করুন, তারপর Verify Access চাপুন।",
+            reply_markup=force_join_keyboard(),
+        )
+
+
 # ---------------- Menu handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -640,16 +731,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         set_referrer(update.message.from_user.id, context.args[0])
     context.user_data.clear()
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     await update.message.reply_text(welcome_text(), reply_markup=MAIN_MENU)
 
 
 async def packages_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     await update.message.reply_text("📦 VPN প্যাকেজসমূহ:", reply_markup=package_keyboard())
 
 
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     context.user_data["state"] = WAITING_SUPPORT
     await update.message.reply_text(
         "🎧 Support: আপনার সমস্যা বা প্রশ্ন এখানে লিখে পাঠান, অ্যাডমিন বট থেকেই উত্তর দেবে।\n\n"
@@ -661,6 +758,8 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_buy_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     await update.message.reply_text(
         "📦 VPN প্যাকেজসমূহ:", reply_markup=package_keyboard()
     )
@@ -668,6 +767,8 @@ async def menu_buy_vpn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_buy_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     await update.message.reply_text(
         "🌐 Proxy প্যাকেজসমূহ:", reply_markup=proxy_keyboard()
     )
@@ -676,6 +777,8 @@ async def menu_buy_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     ensure_user(user)
+    if not await check_force_join(update.message, context.bot, user.id):
+        return
     balance = get_balance(user.id)
     await update.message.reply_text(
         f"💳 আপনার বর্তমান ব্যালেন্স: ৳{balance}\n\n"
@@ -685,6 +788,8 @@ async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     context.user_data["state"] = WAITING_DEPOSIT_AMOUNT
     context.user_data.pop("package", None)
     context.user_data.pop("proxy", None)
@@ -699,6 +804,8 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     ensure_user(user)
+    if not await check_force_join(update.message, context.bot, user.id):
+        return
     link = f"https://t.me/{BOT_USERNAME}?start={user.id}"
     referred_count, total_orders, bonus_paid = get_referral_stats(user.id)
     progress = total_orders % 10
@@ -720,6 +827,8 @@ async def menu_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     ensure_user(user)
+    if not await check_force_join(update.message, context.bot, user.id):
+        return
     orders = get_user_orders(user.id, 10)
     deposits = get_user_deposits(user.id, 5)
     if not orders and not deposits:
@@ -741,6 +850,8 @@ async def menu_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
     context.user_data["state"] = WAITING_SUPPORT
     await update.message.reply_text(
         "🎧 Support: আপনার সমস্যা বা প্রশ্ন এখানে লিখে পাঠান, অ্যাডমিন বট থেকেই উত্তর দেবে।\n\n"
@@ -1400,6 +1511,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     package = context.user_data.get("package")
     user = update.message.from_user
     ensure_user(user)
+    if not await check_force_join(update.message, context.bot, user.id):
+        return
 
     # Support: Support button chaple porer message admin-er kache jabe.
     if state == WAITING_SUPPORT:
@@ -1684,6 +1797,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("Referral"), menu_referral))
     app.add_handler(MessageHandler(filters.Regex("Support"), menu_support))
     app.add_handler(MessageHandler(filters.Regex("আমার অর্ডার"), menu_my_orders))
+    app.add_handler(CallbackQueryHandler(verify_join_callback, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(package_selected, pattern=r"^pkg:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_balance, pattern=r"^paybal:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_cash, pattern=r"^paycash:\d+$"))
