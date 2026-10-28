@@ -124,7 +124,7 @@ PACKAGES = [
 # Jemon: 9Proxy 10 IP 49 -> 59, 9Proxy 100 MB 15 -> 25, ityadi.
 # Stock sonkha bot-e dekhano hoyni, karon bot stock auto komay na.
 PROXIES = [
-    ("10 IP (999999Proxy)", "TK", 59),
+    ("10 IP (9Proxy)", "TK", 59),
     ("100 MB (9Proxy)", "TK", 25),
     ("200 MB (9Proxy)", "TK", 35),
     ("100 MB (RapidProxy)", "TK", 25),
