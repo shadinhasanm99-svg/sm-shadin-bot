@@ -124,17 +124,15 @@ PACKAGES = [
 # Jemon: 9Proxy 10 IP 49 -> 59, 9Proxy 100 MB 15 -> 25, ityadi.
 # Stock sonkha bot-e dekhano hoyni, karon bot stock auto komay na.
 PROXIES = [
-    ("10 IP (9Proxy)", "TK", 59),
-    ("100 MB (9Proxy)", "TK", 25),
-    ("200 MB (9Proxy)", "TK", 35),
-    ("100 MB (RapidProxy)", "TK", 25),
-    ("200 MB (RapidProxy)", "TK", 35),
-    ("100 MB (711Proxy)", "TK", 25),
-    ("200 MB (711Proxy)", "TK", 35),
-    ("100 MB (H143Proxy)", "TK", 19),
-    ("200 MB (H143Proxy)", "TK", 23),
-    ("200 MB (H143Proxy)", "TK", 23666),
-]
+    ("10 IP (9Proxy)", "LT", 59),
+    ("100 MB (9Proxy)", "LT", 25),
+    ("200 MB (9Proxy)", "LT", 35),
+    ("100 MB (RapidProxy)", "LT", 25),
+    ("200 MB (RapidProxy)", "LT", 35),
+    ("100 MB (711Proxy)", "LT", 25),
+    ("200 MB (711Proxy)", "LT", 35),
+    ("100 MB (H143Proxy)", "LT", 19),
+    ("200 MB (H143Proxy)", "LT", 23),
 ]
 
 WAITING_PAYMENT = "waiting_payment"
