@@ -155,7 +155,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("💳 Balance"), KeyboardButton("💰 Deposit")],
         [KeyboardButton("🔗 Referral"), KeyboardButton("🎧 Support")],
         [KeyboardButton("📦 আমার অর্ডার")],
-        [KeyboardButton("📧 Temp Mail")],
+        [KeyboardButton("📧 টেম্প মেইল")],
     ],
     resize_keyboard=True,
 )
@@ -886,10 +886,10 @@ def tm_create(provider):
         if domains:
             members = [d for d in domains.get("hydra:member", []) if d.get("isActive")]
         if not members:
-            return None, "Mail.tm-e ekhon kono active domain nei, onno provider try korun."
+            return None, "Mail.tm-এ এখন কোনো অ্যাক্টিভ ডোমেইন নেই, "
         domain = members[0].get("domain", "")
         if not domain:
-            return None, "Mail.tm domain paoa jayni, onno provider try korun."
+            return None, "Mail.tm ডোমেইন পাওয়া যায়নি, "
         name = tm_random_name(10)
         address = name + "@" + domain
         password = secrets.token_hex(12)
@@ -898,23 +898,23 @@ def tm_create(provider):
             {"address": address, "password": password},
         )
         if not acc or not acc.get("id"):
-            return None, "Mail.tm account banano jayni, abar try korun ba onno provider nin."
+            return None, "Mail.tm অ্যাকাউন্ট বানানো যায়নি, আবার ট্রাই করুন বা অন্য প্রোভাইডার নিন।"
         tok = tm_request_json(
             "POST", "https://api.mail.tm/token",
             {"address": address, "password": password},
         )
         if not tok or not tok.get("token"):
-            return None, "Mail.tm login hoyni, abar try korun ba onno provider nin."
+            return None, "Mail.tm লগইন হয়নি, আবার ট্রাই করুন বা অন্য প্রোভাইডার নিন।"
         return address, {"password": password, "token": tok["token"], "account_id": acc["id"]}
     if provider == "1secmail":
         data = tm_request_json(
             "GET", "https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1"
         )
         if not data or not isinstance(data, list) or not data:
-            return None, "1SecMail ekhon response dicche na, onno provider try korun."
+            return None, "1SecMail এখন রেসপন্স দিচ্ছে না, "
         address = data[0]
         if "@" not in address:
-            return None, "1SecMail theke thikana paoa jayni, onno provider try korun."
+            return None, "1SecMail থেকে ঠিকানা পাওয়া যায়নি, "
         login, domain = address.split("@", 1)
         return address, {"login": login, "domain": domain}
     if provider == "guerrilla":
@@ -922,12 +922,12 @@ def tm_create(provider):
             "GET", "https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=en"
         )
         if not data or not data.get("email_addr"):
-            return None, "Guerrilla Mail ekhon response dicche na, onno provider try korun."
+            return None, "Guerrilla Mail এখন রেসপন্স দিচ্ছে না, "
         return data["email_addr"], {"sid_token": data.get("sid_token", "")}
     if provider == "maildrop":
         name = tm_random_name(12)
         return name + "@maildrop.cc", {"mailbox": name}
-    return None, "Ochena provider."
+    return None, "অচেনা প্রোভাইডার।"
 
 
 def tm_messages(saved):
@@ -942,7 +942,7 @@ def tm_messages(saved):
             headers={"Authorization": "Bearer " + token},
         )
         if not data:
-            return None, "Mail.tm inbox pora jayni, abar Check korun."
+            return None, "Mail.tm ইনবক্স পড়া যায়নি, আবার চেক করুন।"
         members = data.get("hydra:member", [])[:5]
         for m in members:
             mid = m.get("id", "")
@@ -966,7 +966,7 @@ def tm_messages(saved):
             + login + "&domain=" + domain,
         )
         if data is None:
-            return None, "1SecMail inbox pora jayni, abar Check korun."
+            return None, "1SecMail ইনবক্স পড়া যায়নি, আবার চেক করুন।"
         for item in list(data)[-5:][::-1]:
             full = tm_request_json(
                 "GET",
@@ -988,7 +988,7 @@ def tm_messages(saved):
             + sid + "&seq=0",
         )
         if not data:
-            return None, "Guerrilla Mail inbox pora jayni (session sesh hole Change Mail korun)."
+            return None, "Guerrilla Mail ইনবক্স পড়া যায়নি (সেশন শেষ হলে মেইল পরিবর্তন করুন)।"
         for item in (data.get("list", []) or [])[:5]:
             full = tm_request_json(
                 "GET",
@@ -1006,7 +1006,7 @@ def tm_messages(saved):
         q = {"query": 'query Example { inbox(mailbox: "' + mailbox + '") { id headerfrom subject date } }'}
         data = tm_request_json("POST", "https://api.maildrop.cc/graphql", q)
         if not data or data.get("errors"):
-            return None, "Maildrop inbox pora jayni, abar Check korun."
+            return None, "Maildrop ইনবক্স পড়া যায়নি, আবার চেক করুন।"
         inbox = (data.get("data", {}) or {}).get("inbox", []) or []
         for item in inbox[:5]:
             mq = {"query": 'query Example { message(mailbox: "' + mailbox + '", id: "' + str(item.get("id", "")) + '") { id headerfrom subject date data html } }'}
@@ -1019,7 +1019,7 @@ def tm_messages(saved):
                 "body": body,
             })
         return out, None
-    return None, "Ochena provider."
+    return None, "অচেনা প্রোভাইডার।"
 
 
 
@@ -1113,43 +1113,43 @@ def tm_menu_text_and_markup(user_id):
         buttons.append(row)
     if saved:
         text = (
-            "📧 <b>Temp Mail — Free</b>\n\n"
-            "Tomar mail:\n" + code(saved["address"]) + "\n"
-            "Provider: " + esc(TM_PROVIDER_NAMES.get(saved["provider"], saved["provider"])) + "\n\n"
-            "Ei mail ta site-e dao, tarpor 📥 Check Code chapo. "
-            "Site theke abar code pathale abar Check chape notun code asbe.\n\n"
-            "⚠️ Inbox asthayi — code paoar sathe sathe bebohar koro. "
-            "Guruttopurno account-er code ekhane nio na."
+            "📧 <b>টেম্প মেইল</b>\n\n"
+            "তোমার মেইল:\n" + code(saved["address"]) + "\n"
+            "প্রোভাইডার: " + esc(TM_PROVIDER_NAMES.get(saved["provider"], saved["provider"])) + "\n\n"
+            ""
+            "\n\n"
+            ""
+            ""
         )
-        buttons.append([InlineKeyboardButton("📥 Check Code", callback_data="tmcheck")])
-        buttons.append([InlineKeyboardButton("🔄 Change Mail", callback_data="tmchange")])
-        buttons.append([InlineKeyboardButton("🗑️ Delete Mail", callback_data="tmdelete")])
+        buttons.append([InlineKeyboardButton("📥 কোড চেক করুন", callback_data="tmcheck")])
+        buttons.append([InlineKeyboardButton("🔄 মেইল পরিবর্তন", callback_data="tmchange")])
+        buttons.append([InlineKeyboardButton("🗑️ মেইল মুছুন", callback_data="tmdelete")])
     else:
         text = (
-            "📧 <b>Temp Mail — Free</b>\n\n"
-            "Provider beche nau, bot ekta temp mail baniye dibe. "
-            "Jar jeta iccha, sei provider diye kaj korte parbe.\n\n"
-            "Mail.tm: password+token diye surakkha thake.\n"
-            "1SecMail / Maildrop: inbox public, thikana janlei pora jay.\n"
-            "Guerrilla Mail: 1 ghontar jonno thake."
+            "📧 <b>টেম্প মেইল</b>\n\n"
+            ""
+            "\n\n"
+            "\n"
+            "\n"
+            ""
         )
     return text, InlineKeyboardMarkup(buttons)
 
 
-async def tm_gate_callback(query, user_id):
+async def tm_gate_callback(query, bot, user_id):
     if is_admin(user_id):
         return True
-    member = await is_channel_member(query.bot, user_id)
+    member = await is_channel_member(bot, user_id)
     if member is True:
         return True
     if member is None:
-        await query.answer("⚠️ Verify check kora jacche na.", show_alert=True)
+        await query.answer("⚠️ ভেরিফাই চেক করা যাচ্ছে না।", show_alert=True)
         await query.message.reply_text(
             "⚠️ ভেরিফাই চেক করা যাচ্ছে না। বটকে চ্যানেলে অ্যাডমিন করা আছে কিনা দেখুন।\n"
             f"চ্যানেল: {FORCE_JOIN_LINK}"
         )
         return False
-    await query.answer("❌ Age channel-e join kore Verify korun.", show_alert=True)
+    await query.answer("❌ আগে চ্যানেলে জয়েন করে ভেরিফাই করুন।", show_alert=True)
     await query.message.reply_text(force_join_text(), reply_markup=force_join_keyboard(), parse_mode="HTML")
     return False
 
@@ -1170,7 +1170,7 @@ async def tm_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not await tm_gate_callback(query, user_id):
+    if not await tm_gate_callback(query, context.bot, user_id):
         return
     provider = query.data.split(":", 1)[1]
     if provider not in TM_PROVIDER_NAMES:
@@ -1182,9 +1182,9 @@ async def tm_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     address, extra_or_error = tm_create(provider)
     if not address:
         await query.edit_message_text(
-            "❌ " + extra_or_error + "\n\nOnno provider try korun.",
+            "❌ " + extra_or_error + "\n\n",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")]
+                [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")]
             ]),
         )
         return
@@ -1196,7 +1196,7 @@ async def tm_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def tm_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not await tm_gate_callback(query, query.from_user.id):
+    if not await tm_gate_callback(query, context.bot, query.from_user.id):
         return
     text, markup = tm_menu_text_and_markup(query.from_user.id)
     await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -1206,7 +1206,7 @@ async def tm_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not await tm_gate_callback(query, user_id):
+    if not await tm_gate_callback(query, context.bot, user_id):
         return
     saved = tm_get_saved(user_id)
     if not saved:
@@ -1221,7 +1221,7 @@ async def tm_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             "❌ " + extra_or_error,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")]
+                [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")]
             ]),
         )
         return
@@ -1234,7 +1234,7 @@ async def tm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not await tm_gate_callback(query, user_id):
+    if not await tm_gate_callback(query, context.bot, user_id):
         return
     saved = tm_get_saved(user_id)
     if saved:
@@ -1246,9 +1246,9 @@ async def tm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def tm_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("📥 Inbox check kora hocche...")
+    await query.answer("📥 ইনবক্স চেক করা হচ্ছে...")
     user_id = query.from_user.id
-    if not await tm_gate_callback(query, user_id):
+    if not await tm_gate_callback(query, context.bot, user_id):
         return
     saved = tm_get_saved(user_id)
     if not saved:
@@ -1266,29 +1266,29 @@ async def tm_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (error or not messages) and fast_messages:
             messages, error = fast_messages, None
     buttons = [
-        [InlineKeyboardButton("📥 Check Code", callback_data="tmcheck")],
-        [InlineKeyboardButton("🔄 Change Mail", callback_data="tmchange")],
-        [InlineKeyboardButton("🗑️ Delete Mail", callback_data="tmdelete")],
-        [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")],
+        [InlineKeyboardButton("📥 কোড চেক করুন", callback_data="tmcheck")],
+        [InlineKeyboardButton("🔄 মেইল পরিবর্তন", callback_data="tmchange")],
+        [InlineKeyboardButton("🗑️ মেইল মুছুন", callback_data="tmdelete")],
+        [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")],
     ]
     if error:
         await query.edit_message_text(
-            "❌ " + error + "\n\nMail: " + code(saved["address"]),
+            "❌ " + error + "\n\nমেইল: " + code(saved["address"]),
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="HTML",
         )
         return
     if not messages:
         await query.edit_message_text(
-            "📭 <b>Ekhono kono mail aseni.</b>\n\n"
-            "Mail: " + code(saved["address"]) + "\n"
-            "Site-e code pathanor 30 second - 1 minute por abar 📥 Check Code chapo.",
+            "📭 <b>এখনো কোনো মেইল আসেনি।</b>\n\n"
+            "মেইল: " + code(saved["address"]) + "\n"
+            "",
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="HTML",
         )
         return
     parts = [
-        "📧 <b>Temp Mail — Inbox</b>\n\nMail: " + code(saved["address"]) + "\n"
+        "📧 <b>টেম্প মেইল — ইনবক্স</b>\n\nমেইল: " + code(saved["address"]) + "\n"
     ]
     for m in messages:
         frm = esc(m.get("from", ""))
@@ -1296,9 +1296,9 @@ async def tm_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = m.get("body", "") or ""
         codes = tm_find_codes(subj + " " + body)
         snippet = esc(tm_strip_html(body)[:200])
-        block = "✉️ <b>From:</b> " + frm + "\n<b>Subject:</b> " + subj + "\n"
+        block = "✉️ <b>প্রেরক:</b> " + frm + "\n<b>বিষয়:</b> " + subj + "\n"
         if codes:
-            block += "<b>Code:</b> " + " ".join(code(c) for c in codes) + "\n"
+            block += "<b>কোড:</b> " + " ".join(code(c) for c in codes) + "\n"
         if snippet:
             block += snippet + "\n"
         parts.append(block)
@@ -2486,7 +2486,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("Support"), menu_support))
     app.add_handler(MessageHandler(filters.Regex("আমার অর্ডার"), menu_my_orders))
     app.add_handler(CommandHandler("tempmail", tempmail_command))
-    app.add_handler(MessageHandler(filters.Regex("Temp Mail"), menu_tempmail))
+    app.add_handler(MessageHandler(filters.Regex("Temp Mail|টেম্প মেইল"), menu_tempmail))
     app.add_handler(CallbackQueryHandler(tm_provider_callback, pattern=r"^tmprov:"))
     app.add_handler(CallbackQueryHandler(tm_check_callback, pattern=r"^tmcheck$"))
     app.add_handler(CallbackQueryHandler(tm_change_callback, pattern=r"^tmchange$"))
