@@ -56,6 +56,7 @@ Run:
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -106,14 +107,16 @@ FORCE_JOIN_CHANNEL = "@smshadinproxy"
 FORCE_JOIN_LINK = "https://t.me/smshadinproxy"
 
 # (VPN name, duration, price in BDT)
+# Screenshot-er dam-er upor protitite ৳10 jog kora (2026-11-01):
+# Screenshot: 10, 6, 6, 6, 10, 10, 10, 40, 100, 40 -> +10 = 20, 16, 16, 16, 20, 20, 20, 50, 110, 50
 PACKAGES = [
-    ("Nord VPN", "7 din", 25),
-    ("Express VPN", "3 din", 20),
-    ("CyberGhost VPN", "3 din", 20),
-    ("PIA VPN", "3 din", 20),
-    ("Surfshark VPN", "7 din", 25),
-    ("IPVanish VPN", "7 din", 25),
-    ("HMA VPN", "7 din", 25),
+    ("Nord VPN", "7 din", 20),
+    ("Express VPN", "3 din", 16),
+    ("CyberGhost VPN", "3 din", 16),
+    ("PIA VPN", "3 din", 16),
+    ("Surfshark VPN", "7 din", 20),
+    ("IPVanish VPN", "7 din", 20),
+    ("HMA VPN", "7 din", 20),
     ("Proton VPN", "14 din", 50),
     ("Nord VPN", "30 din", 110),
     ("HMA VPN", "30 din", 50),
@@ -639,6 +642,88 @@ def customer_label(user):
     return user.full_name
 
 
+def esc(value):
+    """HTML-escape a value for use inside an HTML-parsed Telegram message."""
+    return html.escape(str(value), quote=False)
+
+
+def code(value):
+    """Wrap ONE copyable value in <code> so tapping it copies just that value."""
+    return f"<code>{esc(value)}</code>"
+
+
+# Field labels recognised in admin-typed delivery details. A plain
+# "word: value" regex cannot tell a value word from the next label
+# ("abc password:" looks like one label), so fields are split on these
+# known labels; anything else falls back to a first-colon split.
+DELIVERY_LABELS = {
+    "username", "user", "email", "password", "pass", "passwd",
+    "server", "host", "ip", "port", "expiry", "expire", "expires",
+    "duration", "type", "protocol", "country", "location", "config",
+    "link", "url", "name", "account", "id", "key", "token", "pin",
+    "address", "city", "plan", "package", "service", "domain",
+    "proxy", "vpn", "login", "userid", "method",
+}
+
+
+def format_delivery_details(details):
+    """Format admin-typed delivery details for tap-to-copy.
+
+    Each "Label: value" field becomes its own line with ONLY the value in
+    <code>, so tapping copies just that field (email, password, server,
+    IP, port, ...). A line without a recognised label is split on its
+    first colon if it has one, otherwise wrapped whole in <code>.
+    Values are HTML-escaped, so a value containing & < > cannot break
+    the message formatting.
+    """
+    text = (details or "").strip()
+    if not text:
+        return ""
+    out = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = []  # (label or None, value)
+        cur_label = None
+        cur_val = []
+
+        def flush():
+            if cur_label is not None or cur_val:
+                fields.append((cur_label, " ".join(cur_val).strip(" ,;")))
+
+        for tok in line.split():
+            stem, sep, rest = tok.partition(":")
+            if sep and stem.lower() in DELIVERY_LABELS:
+                flush()
+                cur_label = stem
+                cur_val = [rest] if rest else []
+            else:
+                cur_val.append(tok)
+        flush()
+        if not any(label for label, _ in fields):
+            # No recognised label: a bare URL stays whole, otherwise
+            # first-colon split, else whole line.
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*://", line):
+                fields = [(None, line)]
+            elif ":" in line:
+                label, _, val = line.partition(":")
+                if val.strip():
+                    fields = [(label.strip(), val.strip())]
+                else:
+                    fields = [(None, line)]
+            else:
+                fields = [(None, line)]
+        for label, value in fields:
+            if label and value:
+                out.append(f"{esc(label)}: {code(value)}")
+            elif label:
+                out.append(esc(label) + ":")
+            else:
+                out.append(code(value))
+    return "\n".join(out)
+
+
 # ---------------- Force join (channel join + Verify Access) ----------------
 
 async def is_channel_member(bot, user_id):
@@ -797,7 +882,8 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
         "Minimum deposit ৳20।\n\n"
-        f"টাকা পাঠাবেন এই নম্বরে:\nবিকাশ / নগদ: {PAYMENT_NUMBER}"
+        f"টাকা পাঠাবেন এই নম্বরে:\nবিকাশ / নগদ: {code(PAYMENT_NUMBER)}"
+        , parse_mode="HTML",
     )
 
 
@@ -814,13 +900,14 @@ async def menu_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = 10
     await update.message.reply_text(
         "🔗 আপনার Referral লিংক:\n"
-        f"{link}\n\n"
+        f"{code(link)}\n\n"
         f"👥 আপনি রেফার করেছেন: {referred_count} জন\n"
         f"🛒 তাদের মোট অর্ডার: {total_orders} টা\n"
         f"🎁 বোনাস পেয়েছেন: ৳{bonus_paid * 5}\n"
         f"⏳ পরের ৳5 বোনাসের জন্য আরো {remaining} টা অর্ডার লাগবে\n\n"
         "নিয়ম: আপনার লিংক দিয়ে আসা বন্ধুরা মোট 10 টা Balance অর্ডার করলেই "
         "আপনি ৳5 বোনাস পাবেন, প্রতি 10 অর্ডারে আবার ৳5।"
+        , parse_mode="HTML",
     )
 
 
@@ -919,11 +1006,11 @@ async def pay_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛒 নতুন অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"📦 প্যাকেজ: {name} - {duration}\n"
         f"💰 দাম: ৳{price}\n"
-        f"👤 কাস্টমার: {customer_label(user)}\n"
-        f"🆔 User ID: {user.id}\n"
+        f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+        f"🆔 User ID: {code(user.id)}\n"
         f"💳 বাকি ব্যালেন্স: ৳{new_balance}"
     )
-    await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+    await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode="HTML")
     if _ref and _ref[2]:
         _ref_id, _ref_total, _ = _ref
         add_balance(_ref_id, 5)
@@ -956,14 +1043,14 @@ async def pay_with_cash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ আপনি বেছেছেন: {name} - {duration}\n"
         f"💰 দাম: ৳{price}\n\n"
         f"💳 পেমেন্ট করুন:\n"
-        f"বিকাশ / নগদ: {PAYMENT_NUMBER}\n\n"
+        f"বিকাশ / নগদ: {code(PAYMENT_NUMBER)}\n\n"
         "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।\n"
         "আমরা যাচাই করে আপনার অ্যাকাউন্ট পাঠিয়ে দেবো।"
     )
     back = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ প্যাকেজ লিস্টে ফিরুন", callback_data="back")],
     ])
-    await query.edit_message_text(text, reply_markup=back)
+    await query.edit_message_text(text, reply_markup=back, parse_mode="HTML")
 
 
 async def back_to_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1033,11 +1120,11 @@ async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_T
         "🛒 নতুন Proxy অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"🌐 প্যাকেজ: {name} - {duration}\n"
         f"💰 দাম: ৳{price}\n"
-        f"👤 কাস্টমার: {customer_label(user)}\n"
-        f"🆔 User ID: {user.id}\n"
+        f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+        f"🆔 User ID: {code(user.id)}\n"
         f"💳 বাকি ব্যালেন্স: ৳{new_balance}"
     )
-    await context.bot.send_message(chat_id=ADMIN_ID, text=caption)
+    await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode="HTML")
     if _ref and _ref[2]:
         _ref_id, _ref_total, _ = _ref
         add_balance(_ref_id, 5)
@@ -1070,14 +1157,14 @@ async def pay_proxy_with_cash(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✅ আপনি বেছেছেন: {name} - {duration}\n"
         f"💰 দাম: ৳{price}\n\n"
         f"💳 পেমেন্ট করুন:\n"
-        f"বিকাশ / নগদ: {PAYMENT_NUMBER}\n\n"
+        f"বিকাশ / নগদ: {code(PAYMENT_NUMBER)}\n\n"
         "পেমেন্ট করার পর TrxID লিখে পাঠান, অথবা পেমেন্টের স্ক্রিনশট পাঠান।\n"
         "আমরা যাচাই করে আপনার Proxy details পাঠিয়ে দেবো।"
     )
     back = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Proxy লিস্টে ফিরুন", callback_data="proxyback")],
     ])
-    await query.edit_message_text(text, reply_markup=back)
+    await query.edit_message_text(text, reply_markup=back, parse_mode="HTML")
 
 
 async def back_to_proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1120,11 +1207,11 @@ async def approve_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if query.message.photo:
             await query.edit_message_caption(
-                caption=(query.message.caption or "") + note
+                caption=(query.message.caption or "") + note, parse_mode="HTML"
             )
         else:
             await query.edit_message_text(
-                (query.message.text or "") + note
+                (query.message.text or "") + note, parse_mode="HTML"
             )
     except Exception as exc:
         logger.warning("Admin message edit korte parini: %s", exc)
@@ -1158,11 +1245,11 @@ async def reject_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if query.message.photo:
             await query.edit_message_caption(
-                caption=(query.message.caption or "") + note
+                caption=(query.message.caption or "") + note, parse_mode="HTML"
             )
         else:
             await query.edit_message_text(
-                (query.message.text or "") + note
+                (query.message.text or "") + note, parse_mode="HTML"
             )
     except Exception as exc:
         logger.warning("Admin message edit korte parini: %s", exc)
@@ -1188,8 +1275,9 @@ async def addbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     new_balance = add_balance(target_id, amount)
     await update.message.reply_text(
-        f"✅ User {target_id}-এর ব্যালেন্স এখন ৳{new_balance} "
+        f"✅ User {code(target_id)}-এর ব্যালেন্স এখন ৳{new_balance} "
         f"({amount:+d} যোগ করা হয়েছে)।"
+        , parse_mode="HTML",
     )
     try:
         await context.bot.send_message(
@@ -1218,11 +1306,11 @@ async def exportbalances_command(update: Update, context: ContextTypes.DEFAULT_T
     lines = ["💳 Balance Backup List:"]
     for user_id, username, balance in rows:
         name = f"@{username}" if username else ""
-        lines.append(f"{user_id} {name} : ৳{balance}")
+        lines.append(f"{code(user_id)} {esc(name)} : ৳{balance}")
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n... (আরও আছে)"
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1281,16 +1369,21 @@ async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text=f"🎉 আপনার VPN অ্যাকাউন্ট রেডি!\n\n{details}\n\n"
-            f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}",
+            text=(
+                "🎉 আপনার VPN অ্যাকাউন্ট রেডি!\n\n"
+                f"{format_delivery_details(details)}\n\n"
+                f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}"
+            ),
+            parse_mode="HTML",
         )
     except Exception as exc:
         logger.warning("VPN pathate parini %s: %s", target_id, exc)
         await update.message.reply_text(
-            f"❌ User {target_id}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+            f"❌ User {code(target_id)}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+            , parse_mode="HTML",
         )
         return
-    await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {target_id}-কে পাঠানো হয়েছে।")
+    await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {code(target_id)}-কে পাঠানো হয়েছে।", parse_mode="HTML")
 
 
 async def sendproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1316,16 +1409,21 @@ async def sendproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text=f"🎉 আপনার Proxy রেডি!\n\n{details}\n\n"
-            f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}",
+            text=(
+                "🎉 আপনার Proxy রেডি!\n\n"
+                f"{format_delivery_details(details)}\n\n"
+                f"কোনো সমস্যা হলে Support-এ মেসেজ করুন:\n{ORDER_LINK}"
+            ),
+            parse_mode="HTML",
         )
     except Exception as exc:
         logger.warning("Proxy pathate parini %s: %s", target_id, exc)
         await update.message.reply_text(
-            f"❌ User {target_id}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+            f"❌ User {code(target_id)}-কে পাঠানো যায়নি। ইউজার বট block করেছে বা User ID ভুল হতে পারে।"
+            , parse_mode="HTML",
         )
         return
-    await update.message.reply_text(f"✅ Proxy details User {target_id}-কে পাঠানো হয়েছে।")
+    await update.message.reply_text(f"✅ Proxy details User {code(target_id)}-কে পাঠানো হয়েছে।", parse_mode="HTML")
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1355,7 +1453,7 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=target_id,
             text=f"🎧 Support থেকে উত্তর:\n{text}",
         )
-        await update.message.reply_text(f"✅ {target_id}-কে উত্তর পাঠানো হয়েছে।")
+        await update.message.reply_text(f"✅ {code(target_id)}-কে উত্তর পাঠানো হয়েছে।", parse_mode="HTML")
     except Exception as exc:
         logger.warning("Reply pathate parini: %s", exc)
         await update.message.reply_text(
@@ -1433,14 +1531,14 @@ def auto_reply_text(text):
         return (
             "💰 Deposit করতে Deposit বোতাম চাপুন, তারপর টাকার পরিমাণ লিখুন।\n"
             "Minimum deposit ৳20।\n"
-            f"বিকাশ / নগদ Send Money করুন: {PAYMENT_NUMBER}\n\n"
+            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
             "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
             "ধন্যবাদ।"
         )
     if any(k in t for k in ("payment", "bkash", "nagad", "বিকাশ", "নগদ", "পেমেন্ট", "টাকা পাঠ")):
         return (
             "💳 পেমেন্ট করুন:\n"
-            f"বিকাশ / নগদ Send Money: {PAYMENT_NUMBER}\n\n"
+            f"বিকাশ / নগদ Send Money: {code(PAYMENT_NUMBER)}\n\n"
             "টাকা পাঠানোর পর TrxID এখানে লিখে পাঠান।\n"
             "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।"
         )
@@ -1456,8 +1554,8 @@ def auto_reply_text(text):
     if any(k in t for k in ("price", "dam", "দাম", "প্রাইস", "package", "প্যাকেজ", "list", "লিস্ট")):
         return (
             "📦 VPN প্যাকেজ:\n"
-            "Nord 7 দিন ৳25, Express 3 দিন ৳20, CyberGhost 3 দিন ৳20, PIA 3 দিন ৳20,\n"
-            "Surfshark 7 দিন ৳25, IPVanish 7 দিন ৳25, HMA 7 দিন ৳25,\n"
+            "Nord 7 দিন ৳20, Express 3 দিন ৳16, CyberGhost 3 দিন ৳16, PIA 3 দিন ৳16,\n"
+            "Surfshark 7 দিন ৳20, IPVanish 7 দিন ৳20, HMA 7 দিন ৳20,\n"
             "Proton 14 দিন ৳50, Nord 30 দিন ৳110, HMA 30 দিন ৳50\n\n"
             "কিনতে নিচের মেনু থেকে Buy VPN চাপুন।"
         )
@@ -1529,24 +1627,26 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 photo=update.message.photo[-1].file_id,
                 caption=(
                     "🎧 নতুন Support মেসেজ!\n"
-                    f"👤 কাস্টমার: {customer_label(user)}\n"
-                    f"🆔 User ID: {user.id}\n"
-                    f"📝 মেসেজ: {update.message.caption or ''}\n"
+                    f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+                    f"🆔 User ID: {code(user.id)}\n"
+                    f"📝 মেসেজ: {esc(update.message.caption or '')}\n"
                     "উত্তর দিতে: /reply "
-                    f"{user.id} <আপনার মেসেজ>"
+                    f"{code(user.id)} {esc('<আপনার মেসেজ>')}"
                 ),
+                parse_mode="HTML",
             )
         else:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
                     "🎧 নতুন Support মেসেজ!\n"
-                    f"👤 কাস্টমার: {customer_label(user)}\n"
-                    f"🆔 User ID: {user.id}\n"
-                    f"📝 মেসেজ: {update.message.text}\n"
+                    f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+                    f"🆔 User ID: {code(user.id)}\n"
+                    f"📝 মেসেজ: {esc(update.message.text)}\n"
                     "উত্তর দিতে: /reply "
-                    f"{user.id} <আপনার মেসেজ>"
+                    f"{code(user.id)} {esc('<আপনার মেসেজ>')}"
                 ),
+                parse_mode="HTML",
             )
         context.user_data.clear()
         await update.message.reply_text(
@@ -1576,9 +1676,10 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["state"] = WAITING_DEPOSIT_PROOF
         await update.message.reply_text(
             f"💰 ৳{amount} Deposit করুন:\n"
-            f"বিকাশ / নগদ Send Money করুন: {PAYMENT_NUMBER}\n\n"
+            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
             "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
             "ধন্যবাদ।"
+            , parse_mode="HTML",
         )
         return
 
@@ -1619,7 +1720,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(
                     f"✅ Auto Payment সফল! ৳{amount} আপনার ব্যালেন্সে যোগ হয়েছে।\n"
                     f"💳 বর্তমান ব্যালেন্স: ৳{new_balance}\n"
-                    f"📝 TrxID: {trxid_clean}"
+                    f"📝 TrxID: {code(trxid_clean)}"
+                    , parse_mode="HTML",
                 )
                 if ADMIN_ID:
                     try:
@@ -1627,12 +1729,13 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                             chat_id=ADMIN_ID,
                             text=(
                                 "🤖 Auto-credited (SMS match, kono manual kaj lageni)!\n"
-                                f"👤 কাস্টমার: {customer_label(user)}\n"
-                                f"🆔 User ID: {user.id}\n"
+                                f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+                                f"🆔 User ID: {code(user.id)}\n"
                                 f"💵 পরিমাণ: ৳{amount}\n"
-                                f"📝 TrxID: {trxid_clean}\n"
+                                f"📝 TrxID: {code(trxid_clean)}\n"
                                 f"💳 বর্তমান ব্যালেন্স: ৳{new_balance}"
                             ),
+                            parse_mode="HTML",
                         )
                     except Exception:
                         pass
@@ -1640,10 +1743,10 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         dep_id = create_deposit(user.id, user.username, amount, trxid)
         caption = (
             "💰 নতুন Deposit Request!\n"
-            f"👤 কাস্টমার: {customer_label(user)}\n"
-            f"🆔 User ID: {user.id}\n"
+            f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+            f"🆔 User ID: {code(user.id)}\n"
             f"💵 পরিমাণ: ৳{amount}\n"
-            f"📝 TrxID / মেসেজ: {trxid or '-'}\n"
+            f"📝 TrxID / মেসেজ: {code(trxid) if trxid else '-'}\n"
             "⚠️ Auto-match hoyni (SMS ekhono aseni ba TrxID mileni) — manual check korun."
         )
         keyboard = InlineKeyboardMarkup([
@@ -1660,11 +1763,11 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             photo_id = update.message.photo[-1].file_id
             await context.bot.send_photo(
                 chat_id=ADMIN_ID, photo=photo_id,
-                caption=caption, reply_markup=keyboard,
+                caption=caption, reply_markup=keyboard, parse_mode="HTML",
             )
         else:
             await context.bot.send_message(
-                chat_id=ADMIN_ID, text=caption, reply_markup=keyboard,
+                chat_id=ADMIN_ID, text=caption, reply_markup=keyboard, parse_mode="HTML",
             )
         context.user_data.clear()
         await update.message.reply_text(
@@ -1689,8 +1792,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             "🛒 নতুন Proxy অর্ডার!\n"
             f"🌐 প্যাকেজ: {pname} - {pduration}\n"
             f"💰 দাম: ৳{pprice}\n"
-            f"👤 কাস্টমার: {customer_label(user)}\n"
-            f"🆔 User ID: {user.id}"
+            f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+            f"🆔 User ID: {code(user.id)}"
         )
         if update.message.photo:
             photo_id = update.message.photo[-1].file_id
@@ -1698,12 +1801,14 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_photo(
                 chat_id=ADMIN_ID,
                 photo=photo_id,
-                caption=pcaption + (f"\n📝 মেসেজ: {text}" if text else ""),
+                caption=pcaption + (f"\n📝 মেসেজ: {esc(text)}" if text else ""),
+                parse_mode="HTML",
             )
         else:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=pcaption + f"\n📝 TrxID / মেসেজ: {update.message.text}",
+                text=pcaption + f"\n📝 TrxID / মেসেজ: {code(update.message.text)}",
+                parse_mode="HTML",
             )
         record_order(user.id, "Proxy", pname, pduration, pprice, "cash", "pending")
         context.user_data.clear()
@@ -1720,7 +1825,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         if update.message.text:
             _auto = auto_reply_text(update.message.text)
             if _auto:
-                await update.message.reply_text(_auto)
+                await update.message.reply_text(_auto, parse_mode="HTML")
                 return
         if get_setting("away", "off") == "on":
             await update.message.reply_text(
@@ -1741,8 +1846,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         "🛒 নতুন অর্ডার!\n"
         f"📦 প্যাকেজ: {name} - {duration}\n"
         f"💰 দাম: ৳{price}\n"
-        f"👤 কাস্টমার: {customer_label(user)}\n"
-        f"🆔 User ID: {user.id}"
+        f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+        f"🆔 User ID: {code(user.id)}"
     )
     if not ADMIN_ID:
         logger.warning("ADMIN_ID set kora nei, tai order forward kora jayni.")
@@ -1757,12 +1862,14 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_photo(
             chat_id=ADMIN_ID,
             photo=photo_id,
-            caption=caption + (f"\n📝 মেসেজ: {text}" if text else ""),
+            caption=caption + (f"\n📝 মেসেজ: {esc(text)}" if text else ""),
+            parse_mode="HTML",
         )
     else:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=caption + f"\n📝 TrxID / মেসেজ: {update.message.text}",
+            text=caption + f"\n📝 TrxID / মেসেজ: {code(update.message.text)}",
+            parse_mode="HTML",
         )
     record_order(user.id, "VPN", name, duration, price, "cash", "pending")
     context.user_data.clear()
