@@ -1,5 +1,5 @@
 """
-SM SHADIN VPN Shop Bot - Auto Balance Version
+SM SHADIN VPN Shop Bot - Hardened Professional Version
 =============================================
 Customer ra ei bot diye package dekhte parbe, balance diye kinte
 parbe, ar Deposit kore balance barate parbe.
@@ -34,8 +34,6 @@ Auto Balance system (SQLite database):
   /sendproxy <user_id> <details>  (shudhu admin, customer-ke Proxy details pathay)
   /users  (shudhu admin, mot bot user sonkha dekhay)
   /away on | /away off  (shudhu admin, away mode chalu/bondho)
-  Temp Mail: menu theke free temp mail (Mail.tm / 1SecMail /
-    Guerrilla Mail / Maildrop), Check Code diye code dekha jay.
 
 Guruttopurno sotorkota (Render FREE):
   Balance-er data ei bot-er SQLite file-e (balance.db) thake.
@@ -66,7 +64,6 @@ import re
 import secrets
 import sqlite3
 import string
-import urllib.request
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -155,7 +152,6 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("💳 Balance"), KeyboardButton("💰 Deposit")],
         [KeyboardButton("🔗 Referral"), KeyboardButton("🎧 Support")],
         [KeyboardButton("📦 আমার অর্ডার")],
-        [KeyboardButton("📧 টেম্প মেইল")],
     ],
     resize_keyboard=True,
 )
@@ -176,11 +172,16 @@ def is_admin(user_id):
 # ---------------- Database ----------------
 
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    # Wait for concurrent handlers instead of failing immediately with "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level="DEFERRED")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def init_db():
     conn = get_conn()
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users ("
         "user_id INTEGER PRIMARY KEY, "
@@ -234,16 +235,28 @@ def init_db():
         "status TEXT DEFAULT 'done', "
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
     )
-    # Temp Mail: proti user-er ekta active inbox. extra-te provider-er
-    # credential thake (Mail.tm token/password, Guerrilla sid_token).
-    # Render redeploy-e SQLite muche gele ei tothyo hariye jabe.
+    # A callback query can be delivered more than once; its ID is an idempotency key.
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS temp_mail ("
-        "user_id INTEGER PRIMARY KEY, "
-        "provider TEXT, "
-        "address TEXT, "
-        "extra TEXT, "
+        "CREATE TABLE IF NOT EXISTS processed_callbacks ("
+        "callback_id TEXT PRIMARY KEY, "
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    # Keep an audit trail for manual/admin balance changes.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS balance_ledger ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER NOT NULL, "
+        "amount INTEGER NOT NULL, "
+        "reason TEXT NOT NULL, "
+        "reference TEXT, "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    # Prevent two successful credits from reusing the same payment transaction ID.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_deposits_credited_trxid "
+        "ON deposits(UPPER(trxid)) "
+        "WHERE trxid IS NOT NULL AND TRIM(trxid) != '' "
+        "AND status IN ('approved', 'auto_approved')"
     )
     conn.commit()
     conn.close()
@@ -492,11 +505,206 @@ def get_deposit(dep_id):
 
 def set_deposit_status(dep_id, status):
     conn = get_conn()
-    conn.execute(
-        "UPDATE deposits SET status = ? WHERE id = ?", (status, dep_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "UPDATE deposits SET status = ? WHERE id = ?", (status, dep_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def approve_deposit_once(dep_id):
+    """Approve and credit in one SQLite transaction; repeated clicks cannot double-credit."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT user_id, amount FROM deposits WHERE id = ? AND status = 'pending'",
+            (dep_id,),
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        user_id, amount = row
+        if amount is None or int(amount) <= 0:
+            conn.rollback()
+            return None
+        changed = conn.execute(
+            "UPDATE deposits SET status = 'approved' WHERE id = ? AND status = 'pending'",
+            (dep_id,),
+        ).rowcount
+        if changed != 1:
+            conn.rollback()
+            return None
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)",
+            (user_id,),
+        )
+        conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (int(amount), user_id))
+        conn.execute(
+            "INSERT INTO balance_ledger (user_id, amount, reason, reference) VALUES (?, ?, 'deposit_approved', ?)",
+            (user_id, int(amount), f"deposit:{dep_id}"),
+        )
+        balance = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        conn.commit()
+        return user_id, int(amount), balance
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reject_deposit_once(dep_id):
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        changed = conn.execute(
+            "UPDATE deposits SET status = 'rejected' WHERE id = ? AND status = 'pending'",
+            (dep_id,),
+        ).rowcount
+        conn.commit()
+        return changed == 1
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def auto_credit_deposit(user_id, username, amount, trxid):
+    """Atomically consume one SMS record and credit one matching deposit."""
+    trxid = (trxid or "").strip().upper()
+    amount = int(amount)
+    if not trxid or amount <= 0:
+        return None
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        already = conn.execute(
+            "SELECT 1 FROM deposits WHERE UPPER(trxid) = ? "
+            "AND status IN ('approved', 'auto_approved') LIMIT 1",
+            (trxid,),
+        ).fetchone()
+        if already:
+            conn.rollback()
+            return None
+        sms = conn.execute(
+            "SELECT amount FROM sms_payments WHERE trxid = ? AND used = 0",
+            (trxid,),
+        ).fetchone()
+        if not sms or int(sms[0]) != amount:
+            conn.rollback()
+            return None
+        cur = conn.execute(
+            "INSERT INTO deposits (user_id, username, amount, trxid, status) "
+            "VALUES (?, ?, ?, ?, 'auto_approved')",
+            (user_id, username or "", amount, trxid),
+        )
+        changed = conn.execute(
+            "UPDATE sms_payments SET used = 1 WHERE trxid = ? AND used = 0 AND amount = ?",
+            (trxid, amount),
+        ).rowcount
+        if changed != 1:
+            conn.rollback()
+            return None
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, balance) VALUES (?, ?, 0)",
+            (user_id, username or ""),
+        )
+        conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        conn.execute(
+            "INSERT INTO balance_ledger (user_id, amount, reason, reference) VALUES (?, ?, 'deposit_auto', ?)",
+            (user_id, amount, f"deposit:{cur.lastrowid}"),
+        )
+        balance = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        conn.commit()
+        return cur.lastrowid, balance
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def purchase_with_balance(user_id, kind, name, duration, price, callback_id):
+    """Charge, create order, and account for referral in one transaction."""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO processed_callbacks (callback_id) VALUES (?)",
+            (str(callback_id),),
+        ).rowcount
+        if inserted != 1:
+            conn.rollback()
+            return {"status": "duplicate"}
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)",
+            (user_id,),
+        )
+        changed = conn.execute(
+            "UPDATE users SET balance = balance - ? "
+            "WHERE user_id = ? AND balance >= ?",
+            (int(price), user_id, int(price)),
+        ).rowcount
+        if changed != 1:
+            conn.rollback()
+            return {"status": "insufficient"}
+        cur = conn.execute(
+            "INSERT INTO orders (user_id, kind, name, duration, price, pay_method, status) "
+            "VALUES (?, ?, ?, ?, ?, 'balance', 'pending')",
+            (user_id, kind, name, duration, int(price)),
+        )
+        order_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO balance_ledger (user_id, amount, reason, reference) VALUES (?, ?, 'purchase', ?)",
+            (user_id, -int(price), f"order:{order_id}"),
+        )
+        ref_row = conn.execute(
+            "SELECT referred_by FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        referral = None
+        if ref_row and ref_row[0]:
+            referrer_id = ref_row[0]
+            conn.execute(
+                "UPDATE users SET ref_orders_total = ref_orders_total + 1 WHERE user_id = ?",
+                (referrer_id,),
+            )
+            total_row = conn.execute(
+                "SELECT ref_orders_total FROM users WHERE user_id = ?", (referrer_id,)
+            ).fetchone()
+            total = total_row[0] if total_row else 0
+            if total > 0 and total % 10 == 0:
+                conn.execute(
+                    "UPDATE users SET ref_bonus_paid = ref_bonus_paid + 1, balance = balance + 5 WHERE user_id = ?",
+                    (referrer_id,),
+                )
+                conn.execute(
+                    "INSERT INTO balance_ledger (user_id, amount, reason, reference) VALUES (?, 5, 'referral_bonus', ?)",
+                    (referrer_id, f"order:{order_id}"),
+                )
+                referral = (referrer_id, total, True)
+            else:
+                referral = (referrer_id, total, False)
+        balance = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        conn.commit()
+        return {"status": "ok", "balance": balance, "order_id": order_id, "referral": referral}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def get_all_user_ids():
@@ -757,553 +965,6 @@ def format_delivery_details(details):
     return "\n".join(out)
 
 
-
-# ---------------- Temp Mail (free, koyekta provider) ----------------
-# Customer-ra menu theke provider beche temp mail nite parbe, site-e
-# oi mail dile code inbox-e asbe, Check Code chape code dekhabe.
-# Kono taka / API key lage na. Provider-gulo shob receive-only.
-# Sotorkota: temp mail inbox asthayi, kono guruttopurno account-er
-# code / recovery ekhane na neoa-i valo. 1SecMail ar Maildrop-er
-# inbox public (thikana janlei je keu porte pare), Mail.tm-e
-# password+token lage, Guerrilla Mail 1 ghontar jonno thake.
-# Render redeploy hole SQLite muche gele temp mail-er tothyo
-# hariye jete pare, tai code paoar sathe sathe bebohar korte hobe.
-
-TM_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-TM_PROVIDERS = [
-    ("mailtm", "Mail.tm"),
-    ("1secmail", "1SecMail"),
-    ("guerrilla", "Guerrilla Mail"),
-    ("maildrop", "Maildrop"),
-]
-TM_PROVIDER_NAMES = dict(TM_PROVIDERS)
-
-
-def tm_request_json(method, url, payload=None, headers=None):
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("User-Agent", TM_UA)
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    for key, val in (headers or {}).items():
-        req.add_header(key, val)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8", "ignore"))
-    except Exception as e:
-        logger.warning(f"Temp Mail request failed {method} {url}: {e}")
-        return None
-
-
-def tm_random_name(n=10):
-    alphabet = string.ascii_lowercase + string.digits
-    return "sm" + "".join(secrets.choice(alphabet) for _ in range(n))
-
-
-def tm_strip_html(text):
-    if not text:
-        return ""
-    cleaned = re.sub(r"<[^>]+>", " ", str(text))
-    cleaned = html.unescape(cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-
-def tm_find_codes(text):
-    seen = []
-    for m in re.findall(r"\b\d{4,8}\b", text or ""):
-        if m not in seen:
-            seen.append(m)
-    return seen[:5]
-
-
-def tm_get_saved(user_id):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT provider, address, extra FROM temp_mail WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-    if not row:
-        return None
-    try:
-        extra = json.loads(row[2]) if row[2] else {}
-    except (ValueError, TypeError):
-        extra = {}
-    return {"provider": row[0], "address": row[1], "extra": extra}
-
-
-def tm_save(user_id, provider, address, extra):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO temp_mail (user_id, provider, address, extra) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET "
-        "provider=excluded.provider, address=excluded.address, extra=excluded.extra, "
-        "created_at=CURRENT_TIMESTAMP",
-        (user_id, provider, address, json.dumps(extra or {})),
-    )
-    conn.commit()
-    conn.close()
-
-
-def tm_delete_saved(user_id):
-    conn = get_conn()
-    conn.execute("DELETE FROM temp_mail WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def tm_remote_delete(saved):
-    # Best-effort: na parle kichu hobe na, purono inbox emnitei expire hobe.
-    try:
-        if saved["provider"] == "mailtm":
-            extra = saved["extra"]
-            if extra.get("account_id") and extra.get("token"):
-                tm_request_json(
-                    "DELETE",
-                    "https://api.mail.tm/accounts/" + str(extra["account_id"]),
-                    headers={"Authorization": "Bearer " + extra["token"]},
-                )
-        elif saved["provider"] == "guerrilla":
-            extra = saved["extra"]
-            if extra.get("sid_token"):
-                tm_request_json(
-                    "GET",
-                    "https://api.guerrillamail.com/ajax.php?f=forget_me&sid_token="
-                    + extra["sid_token"] + "&email_addr=" + saved["address"],
-                )
-    except Exception as e:
-        logger.warning(f"Temp Mail remote delete failed: {e}")
-
-
-def tm_create(provider):
-    # Returns (address, extra) ba (None, error_text)
-    if provider == "mailtm":
-        domains = tm_request_json("GET", "https://api.mail.tm/domains")
-        members = []
-        if domains:
-            members = [d for d in domains.get("hydra:member", []) if d.get("isActive")]
-        if not members:
-            return None, "Mail.tm-এ এখন কোনো অ্যাক্টিভ ডোমেইন নেই, "
-        domain = members[0].get("domain", "")
-        if not domain:
-            return None, "Mail.tm ডোমেইন পাওয়া যায়নি, "
-        name = tm_random_name(10)
-        address = name + "@" + domain
-        password = secrets.token_hex(12)
-        acc = tm_request_json(
-            "POST", "https://api.mail.tm/accounts",
-            {"address": address, "password": password},
-        )
-        if not acc or not acc.get("id"):
-            return None, "Mail.tm অ্যাকাউন্ট বানানো যায়নি, আবার ট্রাই করুন বা অন্য প্রোভাইডার নিন।"
-        tok = tm_request_json(
-            "POST", "https://api.mail.tm/token",
-            {"address": address, "password": password},
-        )
-        if not tok or not tok.get("token"):
-            return None, "Mail.tm লগইন হয়নি, আবার ট্রাই করুন বা অন্য প্রোভাইডার নিন।"
-        return address, {"password": password, "token": tok["token"], "account_id": acc["id"]}
-    if provider == "1secmail":
-        data = tm_request_json(
-            "GET", "https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1"
-        )
-        if not data or not isinstance(data, list) or not data:
-            return None, "1SecMail এখন রেসপন্স দিচ্ছে না, "
-        address = data[0]
-        if "@" not in address:
-            return None, "1SecMail থেকে ঠিকানা পাওয়া যায়নি, "
-        login, domain = address.split("@", 1)
-        return address, {"login": login, "domain": domain}
-    if provider == "guerrilla":
-        data = tm_request_json(
-            "GET", "https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=en"
-        )
-        if not data or not data.get("email_addr"):
-            return None, "Guerrilla Mail এখন রেসপন্স দিচ্ছে না, "
-        return data["email_addr"], {"sid_token": data.get("sid_token", "")}
-    if provider == "maildrop":
-        name = tm_random_name(12)
-        return name + "@maildrop.cc", {"mailbox": name}
-    return None, "অচেনা প্রোভাইডার।"
-
-
-def tm_messages(saved):
-    # Returns (messages, error_text). Message: {from, subject, body}
-    provider = saved["provider"]
-    extra = saved["extra"]
-    out = []
-    if provider == "mailtm":
-        token = extra.get("token", "")
-        data = tm_request_json(
-            "GET", "https://api.mail.tm/messages",
-            headers={"Authorization": "Bearer " + token},
-        )
-        if not data:
-            return None, "Mail.tm ইনবক্স পড়া যায়নি, আবার চেক করুন।"
-        members = data.get("hydra:member", [])[:5]
-        for m in members:
-            mid = m.get("id", "")
-            full = tm_request_json(
-                "GET", "https://api.mail.tm/messages/" + str(mid),
-                headers={"Authorization": "Bearer " + token},
-            ) or {}
-            frm = m.get("from", {}) or {}
-            out.append({
-                "from": frm.get("address", "") or frm.get("name", ""),
-                "subject": m.get("subject", ""),
-                "body": full.get("text", "") or m.get("intro", ""),
-            })
-        return out, None
-    if provider == "1secmail":
-        login = extra.get("login", "")
-        domain = extra.get("domain", "")
-        data = tm_request_json(
-            "GET",
-            "https://www.1secmail.com/api/v1/?action=getMessages&login="
-            + login + "&domain=" + domain,
-        )
-        if data is None:
-            return None, "1SecMail ইনবক্স পড়া যায়নি, আবার চেক করুন।"
-        for item in list(data)[-5:][::-1]:
-            full = tm_request_json(
-                "GET",
-                "https://www.1secmail.com/api/v1/?action=readMessage&login="
-                + login + "&domain=" + domain + "&id=" + str(item.get("id", "")),
-            ) or {}
-            body = full.get("textBody") or full.get("body") or ""
-            out.append({
-                "from": item.get("from", ""),
-                "subject": item.get("subject", ""),
-                "body": tm_strip_html(body),
-            })
-        return out, None
-    if provider == "guerrilla":
-        sid = extra.get("sid_token", "")
-        data = tm_request_json(
-            "GET",
-            "https://api.guerrillamail.com/ajax.php?f=check_email&sid_token="
-            + sid + "&seq=0",
-        )
-        if not data:
-            return None, "Guerrilla Mail ইনবক্স পড়া যায়নি (সেশন শেষ হলে মেইল পরিবর্তন করুন)।"
-        for item in (data.get("list", []) or [])[:5]:
-            full = tm_request_json(
-                "GET",
-                "https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token="
-                + sid + "&email_id=" + str(item.get("mail_id", "")),
-            ) or {}
-            out.append({
-                "from": item.get("mail_from", ""),
-                "subject": item.get("mail_subject", ""),
-                "body": tm_strip_html(full.get("mail_body", "") or item.get("mail_excerpt", "")),
-            })
-        return out, None
-    if provider == "maildrop":
-        mailbox = extra.get("mailbox", "")
-        q = {"query": 'query Example { inbox(mailbox: "' + mailbox + '") { id headerfrom subject date } }'}
-        data = tm_request_json("POST", "https://api.maildrop.cc/graphql", q)
-        if not data or data.get("errors"):
-            return None, "Maildrop ইনবক্স পড়া যায়নি, আবার চেক করুন।"
-        inbox = (data.get("data", {}) or {}).get("inbox", []) or []
-        for item in inbox[:5]:
-            mq = {"query": 'query Example { message(mailbox: "' + mailbox + '", id: "' + str(item.get("id", "")) + '") { id headerfrom subject date data html } }'}
-            full = tm_request_json("POST", "https://api.maildrop.cc/graphql", mq) or {}
-            msg = ((full.get("data", {}) or {}).get("message", {}) or {})
-            body = msg.get("data") or tm_strip_html(msg.get("html", ""))
-            out.append({
-                "from": item.get("headerfrom", ""),
-                "subject": item.get("subject", ""),
-                "body": body,
-            })
-        return out, None
-    return None, "অচেনা প্রোভাইডার।"
-
-
-
-def tm_check_fast(saved):
-    # Fast path: Check chapar por 1-2 second-e code deoar jonno.
-    # Prothome shudhu mail-er LIST (1 ta request) theke code khunji:
-    # Mail.tm-er intro, Guerrilla-r excerpt, 1SecMail/Maildrop-er subject.
-    # Code paoa gele ar full body fetch kora lage na, tai uttor druto ase.
-    # Code na paoa gele ba inbox khali hole caller full tm_messages-e jabe.
-    # Returns (messages_or_None, error_or_None, has_code_bool)
-    provider = saved["provider"]
-    extra = saved["extra"]
-    if provider == "mailtm":
-        data = tm_request_json(
-            "GET", "https://api.mail.tm/messages",
-            headers={"Authorization": "Bearer " + extra.get("token", "")},
-        )
-        if not data:
-            return None, None, False
-        out = []
-        for m in (data.get("hydra:member", []) or [])[:5]:
-            frm = m.get("from", {}) or {}
-            out.append({
-                "from": frm.get("address", "") or frm.get("name", ""),
-                "subject": m.get("subject", ""),
-                "body": m.get("intro", ""),
-            })
-        has = any(tm_find_codes(m["subject"] + " " + m["body"]) for m in out)
-        return out, None, has
-    if provider == "1secmail":
-        data = tm_request_json(
-            "GET",
-            "https://www.1secmail.com/api/v1/?action=getMessages&login="
-            + extra.get("login", "") + "&domain=" + extra.get("domain", ""),
-        )
-        if data is None:
-            return None, None, False
-        out = []
-        for item in list(data)[-5:][::-1]:
-            out.append({
-                "from": item.get("from", ""),
-                "subject": item.get("subject", ""),
-                "body": "",
-            })
-        has = any(tm_find_codes(m["subject"]) for m in out)
-        return out, None, has
-    if provider == "guerrilla":
-        data = tm_request_json(
-            "GET",
-            "https://api.guerrillamail.com/ajax.php?f=check_email&sid_token="
-            + extra.get("sid_token", "") + "&seq=0",
-        )
-        if not data:
-            return None, None, False
-        out = []
-        for item in (data.get("list", []) or [])[:5]:
-            out.append({
-                "from": item.get("mail_from", ""),
-                "subject": item.get("mail_subject", ""),
-                "body": item.get("mail_excerpt", ""),
-            })
-        has = any(tm_find_codes(m["subject"] + " " + m["body"]) for m in out)
-        return out, None, has
-    if provider == "maildrop":
-        mailbox = extra.get("mailbox", "")
-        q = {"query": 'query Example { inbox(mailbox: "' + mailbox + '") { id headerfrom subject date } }'}
-        data = tm_request_json("POST", "https://api.maildrop.cc/graphql", q)
-        if not data or data.get("errors"):
-            return None, None, False
-        out = []
-        for item in ((data.get("data", {}) or {}).get("inbox", []) or [])[:5]:
-            out.append({
-                "from": item.get("headerfrom", ""),
-                "subject": item.get("subject", ""),
-                "body": "",
-            })
-        has = any(tm_find_codes(m["subject"]) for m in out)
-        return out, None, has
-    return None, None, False
-
-def tm_menu_text_and_markup(user_id):
-    saved = tm_get_saved(user_id)
-    buttons = []
-    row = []
-    for key, label in TM_PROVIDERS:
-        row.append(InlineKeyboardButton(label, callback_data="tmprov:" + key))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    if saved:
-        text = (
-            "📧 <b>টেম্প মেইল</b>\n\n"
-            "তোমার মেইল:\n" + code(saved["address"]) + "\n"
-            "প্রোভাইডার: " + esc(TM_PROVIDER_NAMES.get(saved["provider"], saved["provider"])) + "\n\n"
-            ""
-            "\n\n"
-            ""
-            ""
-        )
-        buttons.append([InlineKeyboardButton("📥 কোড চেক করুন", callback_data="tmcheck")])
-        buttons.append([InlineKeyboardButton("🔄 মেইল পরিবর্তন", callback_data="tmchange")])
-        buttons.append([InlineKeyboardButton("🗑️ মেইল মুছুন", callback_data="tmdelete")])
-    else:
-        text = (
-            "📧 <b>টেম্প মেইল</b>\n\n"
-            ""
-            "\n\n"
-            "\n"
-            "\n"
-            ""
-        )
-    return text, InlineKeyboardMarkup(buttons)
-
-
-async def tm_gate_callback(query, bot, user_id):
-    if is_admin(user_id):
-        return True
-    member = await is_channel_member(bot, user_id)
-    if member is True:
-        return True
-    if member is None:
-        await query.answer("⚠️ ভেরিফাই চেক করা যাচ্ছে না।", show_alert=True)
-        await query.message.reply_text(
-            "⚠️ ভেরিফাই চেক করা যাচ্ছে না। বটকে চ্যানেলে অ্যাডমিন করা আছে কিনা দেখুন।\n"
-            f"চ্যানেল: {FORCE_JOIN_LINK}"
-        )
-        return False
-    await query.answer("❌ আগে চ্যানেলে জয়েন করে ভেরিফাই করুন।", show_alert=True)
-    await query.message.reply_text(force_join_text(), reply_markup=force_join_keyboard(), parse_mode="HTML")
-    return False
-
-
-async def menu_tempmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.message.from_user)
-    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
-        return
-    text, markup = tm_menu_text_and_markup(update.message.from_user.id)
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-async def tempmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await menu_tempmail(update, context)
-
-
-async def tm_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not await tm_gate_callback(query, context.bot, user_id):
-        return
-    provider = query.data.split(":", 1)[1]
-    if provider not in TM_PROVIDER_NAMES:
-        return
-    old = tm_get_saved(user_id)
-    if old:
-        tm_remote_delete(old)
-        tm_delete_saved(user_id)
-    address, extra_or_error = tm_create(provider)
-    if not address:
-        await query.edit_message_text(
-            "❌ " + extra_or_error + "\n\n",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")]
-            ]),
-        )
-        return
-    tm_save(user_id, provider, address, extra_or_error)
-    text, markup = tm_menu_text_and_markup(user_id)
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-async def tm_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not await tm_gate_callback(query, context.bot, query.from_user.id):
-        return
-    text, markup = tm_menu_text_and_markup(query.from_user.id)
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-async def tm_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not await tm_gate_callback(query, context.bot, user_id):
-        return
-    saved = tm_get_saved(user_id)
-    if not saved:
-        text, markup = tm_menu_text_and_markup(user_id)
-        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-        return
-    provider = saved["provider"]
-    tm_remote_delete(saved)
-    tm_delete_saved(user_id)
-    address, extra_or_error = tm_create(provider)
-    if not address:
-        await query.edit_message_text(
-            "❌ " + extra_or_error,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")]
-            ]),
-        )
-        return
-    tm_save(user_id, provider, address, extra_or_error)
-    text, markup = tm_menu_text_and_markup(user_id)
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-async def tm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not await tm_gate_callback(query, context.bot, user_id):
-        return
-    saved = tm_get_saved(user_id)
-    if saved:
-        tm_remote_delete(saved)
-        tm_delete_saved(user_id)
-    text, markup = tm_menu_text_and_markup(user_id)
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-async def tm_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("📥 ইনবক্স চেক করা হচ্ছে...")
-    user_id = query.from_user.id
-    if not await tm_gate_callback(query, context.bot, user_id):
-        return
-    saved = tm_get_saved(user_id)
-    if not saved:
-        text, markup = tm_menu_text_and_markup(user_id)
-        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-        return
-    # Fast path age: list thekei code paoa gele 1 ta request-ei uttor.
-    fast_messages, _fast_error, fast_has_code = tm_check_fast(saved)
-    if fast_messages is not None and (not fast_messages or fast_has_code):
-        messages, error = fast_messages, None
-    else:
-        messages, error = tm_messages(saved)
-        # Guerrilla-r list dwitiyo bar khali aste pare, tai full fetch
-        # khali/error hole fast-er paoa mail-guloi dekhano hobe.
-        if (error or not messages) and fast_messages:
-            messages, error = fast_messages, None
-    buttons = [
-        [InlineKeyboardButton("📥 কোড চেক করুন", callback_data="tmcheck")],
-        [InlineKeyboardButton("🔄 মেইল পরিবর্তন", callback_data="tmchange")],
-        [InlineKeyboardButton("🗑️ মেইল মুছুন", callback_data="tmdelete")],
-        [InlineKeyboardButton("⬅️ প্রোভাইডার লিস্ট", callback_data="tmback")],
-    ]
-    if error:
-        await query.edit_message_text(
-            "❌ " + error + "\n\nমেইল: " + code(saved["address"]),
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="HTML",
-        )
-        return
-    if not messages:
-        await query.edit_message_text(
-            "📭 <b>এখনো কোনো মেইল আসেনি।</b>\n\n"
-            "মেইল: " + code(saved["address"]) + "\n"
-            "",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="HTML",
-        )
-        return
-    parts = [
-        "📧 <b>টেম্প মেইল — ইনবক্স</b>\n\nমেইল: " + code(saved["address"]) + "\n"
-    ]
-    for m in messages:
-        frm = esc(m.get("from", ""))
-        subj = esc(m.get("subject", ""))
-        body = m.get("body", "") or ""
-        codes = tm_find_codes(subj + " " + body)
-        snippet = esc(tm_strip_html(body)[:200])
-        block = "✉️ <b>প্রেরক:</b> " + frm + "\n<b>বিষয়:</b> " + subj + "\n"
-        if codes:
-            block += "<b>কোড:</b> " + " ".join(code(c) for c in codes) + "\n"
-        if snippet:
-            block += snippet + "\n"
-        parts.append(block)
-    text = "\n".join(parts)[:3800]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
 
 # ---------------- Force join (channel join + Verify Access) ----------------
 
@@ -1572,17 +1233,19 @@ async def pay_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👉 {ORDER_LINK}"
         )
         return
-    balance = get_balance(user.id)
-    if balance < price:
+    result = purchase_with_balance(user.id, "VPN", name, duration, price, query.id)
+    if result["status"] == "duplicate":
+        await query.answer("এই অর্ডার আগেই প্রসেস হয়েছে।", show_alert=True)
+        return
+    if result["status"] == "insufficient":
+        balance = get_balance(user.id)
         await query.answer(
-            f"ব্যালেন্স কম! আপনার ব্যালেন্স ৳{balance}, দরকার ৳{price}। "
-            "আগে Deposit করুন।",
+            f"ব্যালেন্স কম! আপনার ব্যালেন্স ৳{balance}, দরকার ৳{price}। আগে Deposit করুন।",
             show_alert=True,
         )
         return
-    new_balance = add_balance(user.id, -price)
-    record_order(user.id, "VPN", name, duration, price, "balance", "done")
-    _ref = record_referral_order(user.id)
+    new_balance = result["balance"]
+    _ref = result["referral"]
     caption = (
         "🛒 নতুন অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"📦 প্যাকেজ: {name} - {duration}\n"
@@ -1594,7 +1257,6 @@ async def pay_with_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode="HTML")
     if _ref and _ref[2]:
         _ref_id, _ref_total, _ = _ref
-        add_balance(_ref_id, 5)
         try:
             await context.bot.send_message(
                 chat_id=_ref_id,
@@ -1686,17 +1348,19 @@ async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_T
             f"👉 {ORDER_LINK}"
         )
         return
-    balance = get_balance(user.id)
-    if balance < price:
+    result = purchase_with_balance(user.id, "Proxy", name, duration, price, query.id)
+    if result["status"] == "duplicate":
+        await query.answer("এই অর্ডার আগেই প্রসেস হয়েছে।", show_alert=True)
+        return
+    if result["status"] == "insufficient":
+        balance = get_balance(user.id)
         await query.answer(
-            f"ব্যালেন্স কম! আপনার ব্যালেন্স ৳{balance}, দরকার ৳{price}। "
-            "আগে Deposit করুন।",
+            f"ব্যালেন্স কম! আপনার ব্যালেন্স ৳{balance}, দরকার ৳{price}। আগে Deposit করুন।",
             show_alert=True,
         )
         return
-    new_balance = add_balance(user.id, -price)
-    record_order(user.id, "Proxy", name, duration, price, "balance", "done")
-    _ref = record_referral_order(user.id)
+    new_balance = result["balance"]
+    _ref = result["referral"]
     caption = (
         "🛒 নতুন Proxy অর্ডার (Balance দিয়ে পেমেন্ট)!\n"
         f"🌐 প্যাকেজ: {name} - {duration}\n"
@@ -1708,7 +1372,6 @@ async def pay_proxy_with_balance(update: Update, context: ContextTypes.DEFAULT_T
     await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode="HTML")
     if _ref and _ref[2]:
         _ref_id, _ref_total, _ = _ref
-        add_balance(_ref_id, 5)
         try:
             await context.bot.send_message(
                 chat_id=_ref_id,
@@ -1764,17 +1427,16 @@ async def approve_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(query.from_user.id):
         await query.answer("শুধু অ্যাডমিন Approve করতে পারবে।", show_alert=True)
         return
-    dep_id = int(query.data.split(":")[1])
-    row = get_deposit(dep_id)
-    if not row:
-        await query.answer("এই Deposit পাওয়া যায়নি।", show_alert=True)
+    try:
+        dep_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer("Deposit ID সঠিক নয়।", show_alert=True)
         return
-    user_id, amount, status = row
-    if status != "pending":
-        await query.answer("এই request আগেই সম্পন্ন করা হয়েছে।", show_alert=True)
+    result = approve_deposit_once(dep_id)
+    if not result:
+        await query.answer("এই request নেই, অথবা আগেই সম্পন্ন হয়েছে।", show_alert=True)
         return
-    new_balance = add_balance(user_id, amount)
-    set_deposit_status(dep_id, "approved")
+    user_id, amount, new_balance = result
     try:
         await context.bot.send_message(
             chat_id=user_id,
@@ -1803,16 +1465,19 @@ async def reject_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(query.from_user.id):
         await query.answer("শুধু অ্যাডমিন Reject করতে পারবে।", show_alert=True)
         return
-    dep_id = int(query.data.split(":")[1])
+    try:
+        dep_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer("Deposit ID সঠিক নয়।", show_alert=True)
+        return
     row = get_deposit(dep_id)
     if not row:
         await query.answer("এই Deposit পাওয়া যায়নি।", show_alert=True)
         return
     user_id, amount, status = row
-    if status != "pending":
-        await query.answer("এই request আগেই সম্পন্ন করা হয়েছে।", show_alert=True)
+    if not reject_deposit_once(dep_id):
+        await query.answer("এই request আগেই সম্পন্ন হয়েছে।", show_alert=True)
         return
-    set_deposit_status(dep_id, "rejected")
     try:
         await context.bot.send_message(
             chat_id=user_id,
@@ -1854,7 +1519,25 @@ async def addbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("User ID আর টাকা, দুটোই সংখ্যায় লিখতে হবে।")
         return
-    new_balance = add_balance(target_id, amount)
+    if target_id <= 0 or amount <= 0 or amount > 1000000:
+        await update.message.reply_text("User ID ও টাকা পজিটিভ হতে হবে; একবারে সর্বোচ্চ ৳১০,০০,০০০।")
+        return
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (target_id,))
+        conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
+        conn.execute(
+            "INSERT INTO balance_ledger (user_id, amount, reason, reference) VALUES (?, ?, 'admin_addbalance', ?)",
+            (target_id, amount, f"admin:{user.id}"),
+        )
+        new_balance = conn.execute("SELECT balance FROM users WHERE user_id = ?", (target_id,)).fetchone()[0]
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     await update.message.reply_text(
         f"✅ User {code(target_id)}-এর ব্যালেন্স এখন ৳{new_balance} "
         f"({amount:+d} যোগ করা হয়েছে)।"
@@ -1927,6 +1610,31 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Broadcast শেষ! পেয়েছে: {success} জন, পায়নি: {failed} জন।")
 
 
+def mark_latest_pending_order_delivered(user_id, kind):
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id FROM orders WHERE user_id = ? AND kind = ? AND status = 'pending' "
+            "ORDER BY id ASC LIMIT 1",
+            (user_id, kind),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE orders SET status = 'delivered' WHERE id = ? AND status = 'pending'",
+            (row[0],),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     if not is_admin(user.id):
@@ -1964,6 +1672,7 @@ async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             , parse_mode="HTML",
         )
         return
+    mark_latest_pending_order_delivered(target_id, "VPN")
     await update.message.reply_text(f"✅ VPN অ্যাকাউন্ট User {code(target_id)}-কে পাঠানো হয়েছে।", parse_mode="HTML")
 
 
@@ -2004,6 +1713,7 @@ async def sendproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             , parse_mode="HTML",
         )
         return
+    mark_latest_pending_order_delivered(target_id, "Proxy")
     await update.message.reply_text(f"✅ Proxy details User {code(target_id)}-কে পাঠানো হয়েছে।", parse_mode="HTML")
 
 
@@ -2292,11 +2002,9 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                     "এটা আপনার পেমেন্ট হলে Support-এ মেসেজ করুন।"
                 )
                 return
-            if find_unused_sms(trxid_clean, amount):
-                dep_id = create_deposit(user.id, user.username, amount, trxid_clean)
-                set_deposit_status(dep_id, "auto_approved")
-                mark_sms_used(trxid_clean)
-                new_balance = add_balance(user.id, amount)
+            auto_result = auto_credit_deposit(user.id, user.username, amount, trxid_clean)
+            if auto_result:
+                dep_id, new_balance = auto_result
                 context.user_data.clear()
                 await update.message.reply_text(
                     f"✅ Auto Payment সফল! ৳{amount} আপনার ব্যালেন্সে যোগ হয়েছে।\n"
@@ -2485,13 +2193,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("Referral"), menu_referral))
     app.add_handler(MessageHandler(filters.Regex("Support"), menu_support))
     app.add_handler(MessageHandler(filters.Regex("আমার অর্ডার"), menu_my_orders))
-    app.add_handler(CommandHandler("tempmail", tempmail_command))
-    app.add_handler(MessageHandler(filters.Regex("Temp Mail|টেম্প মেইল"), menu_tempmail))
-    app.add_handler(CallbackQueryHandler(tm_provider_callback, pattern=r"^tmprov:"))
-    app.add_handler(CallbackQueryHandler(tm_check_callback, pattern=r"^tmcheck$"))
-    app.add_handler(CallbackQueryHandler(tm_change_callback, pattern=r"^tmchange$"))
-    app.add_handler(CallbackQueryHandler(tm_delete_callback, pattern=r"^tmdelete$"))
-    app.add_handler(CallbackQueryHandler(tm_back_callback, pattern=r"^tmback$"))
     app.add_handler(CallbackQueryHandler(verify_join_callback, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(package_selected, pattern=r"^pkg:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_balance, pattern=r"^paybal:\d+$"))
