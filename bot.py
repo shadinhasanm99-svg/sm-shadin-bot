@@ -34,6 +34,8 @@ Auto Balance system (SQLite database):
   /sendproxy <user_id> <details>  (shudhu admin, customer-ke Proxy details pathay)
   /users  (shudhu admin, mot bot user sonkha dekhay)
   /away on | /away off  (shudhu admin, away mode chalu/bondho)
+  Temp Mail: menu theke free temp mail (Mail.tm / 1SecMail /
+    Guerrilla Mail / Maildrop), Check Code diye code dekha jay.
 
 Guruttopurno sotorkota (Render FREE):
   Balance-er data ei bot-er SQLite file-e (balance.db) thake.
@@ -61,7 +63,10 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import string
+import urllib.request
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -150,6 +155,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("💳 Balance"), KeyboardButton("💰 Deposit")],
         [KeyboardButton("🔗 Referral"), KeyboardButton("🎧 Support")],
         [KeyboardButton("📦 আমার অর্ডার")],
+        [KeyboardButton("📧 Temp Mail")],
     ],
     resize_keyboard=True,
 )
@@ -226,6 +232,17 @@ def init_db():
         "price INTEGER, "
         "pay_method TEXT, "
         "status TEXT DEFAULT 'done', "
+        "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    # Temp Mail: proti user-er ekta active inbox. extra-te provider-er
+    # credential thake (Mail.tm token/password, Guerrilla sid_token).
+    # Render redeploy-e SQLite muche gele ei tothyo hariye jabe.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS temp_mail ("
+        "user_id INTEGER PRIMARY KEY, "
+        "provider TEXT, "
+        "address TEXT, "
+        "extra TEXT, "
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
     )
     conn.commit()
@@ -652,6 +669,22 @@ def code(value):
     return f"<code>{esc(value)}</code>"
 
 
+def raw_command_text(update, skip_tokens):
+    """Return the raw text after the command and `skip_tokens` leading words.
+
+    Why this exists: context.args splits on ALL whitespace, so
+    " ".join(context.args) turns every newline into a space and a
+    multi-line admin message arrives as one jumbled paragraph.
+    Splitting the original message text instead preserves line breaks.
+    Falls back to "" if the message has no such remainder.
+    """
+    text = update.message.text or ""
+    parts = text.split(None, skip_tokens)
+    if len(parts) > skip_tokens:
+        return parts[-1]
+    return ""
+
+
 # Field labels recognised in admin-typed delivery details. A plain
 # "word: value" regex cannot tell a value word from the next label
 # ("abc password:" looks like one label), so fields are split on these
@@ -723,6 +756,554 @@ def format_delivery_details(details):
                 out.append(code(value))
     return "\n".join(out)
 
+
+
+# ---------------- Temp Mail (free, koyekta provider) ----------------
+# Customer-ra menu theke provider beche temp mail nite parbe, site-e
+# oi mail dile code inbox-e asbe, Check Code chape code dekhabe.
+# Kono taka / API key lage na. Provider-gulo shob receive-only.
+# Sotorkota: temp mail inbox asthayi, kono guruttopurno account-er
+# code / recovery ekhane na neoa-i valo. 1SecMail ar Maildrop-er
+# inbox public (thikana janlei je keu porte pare), Mail.tm-e
+# password+token lage, Guerrilla Mail 1 ghontar jonno thake.
+# Render redeploy hole SQLite muche gele temp mail-er tothyo
+# hariye jete pare, tai code paoar sathe sathe bebohar korte hobe.
+
+TM_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+TM_PROVIDERS = [
+    ("mailtm", "Mail.tm"),
+    ("1secmail", "1SecMail"),
+    ("guerrilla", "Guerrilla Mail"),
+    ("maildrop", "Maildrop"),
+]
+TM_PROVIDER_NAMES = dict(TM_PROVIDERS)
+
+
+def tm_request_json(method, url, payload=None, headers=None):
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", TM_UA)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for key, val in (headers or {}).items():
+        req.add_header(key, val)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        logger.warning(f"Temp Mail request failed {method} {url}: {e}")
+        return None
+
+
+def tm_random_name(n=10):
+    alphabet = string.ascii_lowercase + string.digits
+    return "sm" + "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def tm_strip_html(text):
+    if not text:
+        return ""
+    cleaned = re.sub(r"<[^>]+>", " ", str(text))
+    cleaned = html.unescape(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def tm_find_codes(text):
+    seen = []
+    for m in re.findall(r"\b\d{4,8}\b", text or ""):
+        if m not in seen:
+            seen.append(m)
+    return seen[:5]
+
+
+def tm_get_saved(user_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT provider, address, extra FROM temp_mail WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        extra = json.loads(row[2]) if row[2] else {}
+    except (ValueError, TypeError):
+        extra = {}
+    return {"provider": row[0], "address": row[1], "extra": extra}
+
+
+def tm_save(user_id, provider, address, extra):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO temp_mail (user_id, provider, address, extra) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "provider=excluded.provider, address=excluded.address, extra=excluded.extra, "
+        "created_at=CURRENT_TIMESTAMP",
+        (user_id, provider, address, json.dumps(extra or {})),
+    )
+    conn.commit()
+    conn.close()
+
+
+def tm_delete_saved(user_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM temp_mail WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def tm_remote_delete(saved):
+    # Best-effort: na parle kichu hobe na, purono inbox emnitei expire hobe.
+    try:
+        if saved["provider"] == "mailtm":
+            extra = saved["extra"]
+            if extra.get("account_id") and extra.get("token"):
+                tm_request_json(
+                    "DELETE",
+                    "https://api.mail.tm/accounts/" + str(extra["account_id"]),
+                    headers={"Authorization": "Bearer " + extra["token"]},
+                )
+        elif saved["provider"] == "guerrilla":
+            extra = saved["extra"]
+            if extra.get("sid_token"):
+                tm_request_json(
+                    "GET",
+                    "https://api.guerrillamail.com/ajax.php?f=forget_me&sid_token="
+                    + extra["sid_token"] + "&email_addr=" + saved["address"],
+                )
+    except Exception as e:
+        logger.warning(f"Temp Mail remote delete failed: {e}")
+
+
+def tm_create(provider):
+    # Returns (address, extra) ba (None, error_text)
+    if provider == "mailtm":
+        domains = tm_request_json("GET", "https://api.mail.tm/domains")
+        members = []
+        if domains:
+            members = [d for d in domains.get("hydra:member", []) if d.get("isActive")]
+        if not members:
+            return None, "Mail.tm-e ekhon kono active domain nei, onno provider try korun."
+        domain = members[0].get("domain", "")
+        if not domain:
+            return None, "Mail.tm domain paoa jayni, onno provider try korun."
+        name = tm_random_name(10)
+        address = name + "@" + domain
+        password = secrets.token_hex(12)
+        acc = tm_request_json(
+            "POST", "https://api.mail.tm/accounts",
+            {"address": address, "password": password},
+        )
+        if not acc or not acc.get("id"):
+            return None, "Mail.tm account banano jayni, abar try korun ba onno provider nin."
+        tok = tm_request_json(
+            "POST", "https://api.mail.tm/token",
+            {"address": address, "password": password},
+        )
+        if not tok or not tok.get("token"):
+            return None, "Mail.tm login hoyni, abar try korun ba onno provider nin."
+        return address, {"password": password, "token": tok["token"], "account_id": acc["id"]}
+    if provider == "1secmail":
+        data = tm_request_json(
+            "GET", "https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1"
+        )
+        if not data or not isinstance(data, list) or not data:
+            return None, "1SecMail ekhon response dicche na, onno provider try korun."
+        address = data[0]
+        if "@" not in address:
+            return None, "1SecMail theke thikana paoa jayni, onno provider try korun."
+        login, domain = address.split("@", 1)
+        return address, {"login": login, "domain": domain}
+    if provider == "guerrilla":
+        data = tm_request_json(
+            "GET", "https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=en"
+        )
+        if not data or not data.get("email_addr"):
+            return None, "Guerrilla Mail ekhon response dicche na, onno provider try korun."
+        return data["email_addr"], {"sid_token": data.get("sid_token", "")}
+    if provider == "maildrop":
+        name = tm_random_name(12)
+        return name + "@maildrop.cc", {"mailbox": name}
+    return None, "Ochena provider."
+
+
+def tm_messages(saved):
+    # Returns (messages, error_text). Message: {from, subject, body}
+    provider = saved["provider"]
+    extra = saved["extra"]
+    out = []
+    if provider == "mailtm":
+        token = extra.get("token", "")
+        data = tm_request_json(
+            "GET", "https://api.mail.tm/messages",
+            headers={"Authorization": "Bearer " + token},
+        )
+        if not data:
+            return None, "Mail.tm inbox pora jayni, abar Check korun."
+        members = data.get("hydra:member", [])[:5]
+        for m in members:
+            mid = m.get("id", "")
+            full = tm_request_json(
+                "GET", "https://api.mail.tm/messages/" + str(mid),
+                headers={"Authorization": "Bearer " + token},
+            ) or {}
+            frm = m.get("from", {}) or {}
+            out.append({
+                "from": frm.get("address", "") or frm.get("name", ""),
+                "subject": m.get("subject", ""),
+                "body": full.get("text", "") or m.get("intro", ""),
+            })
+        return out, None
+    if provider == "1secmail":
+        login = extra.get("login", "")
+        domain = extra.get("domain", "")
+        data = tm_request_json(
+            "GET",
+            "https://www.1secmail.com/api/v1/?action=getMessages&login="
+            + login + "&domain=" + domain,
+        )
+        if data is None:
+            return None, "1SecMail inbox pora jayni, abar Check korun."
+        for item in list(data)[-5:][::-1]:
+            full = tm_request_json(
+                "GET",
+                "https://www.1secmail.com/api/v1/?action=readMessage&login="
+                + login + "&domain=" + domain + "&id=" + str(item.get("id", "")),
+            ) or {}
+            body = full.get("textBody") or full.get("body") or ""
+            out.append({
+                "from": item.get("from", ""),
+                "subject": item.get("subject", ""),
+                "body": tm_strip_html(body),
+            })
+        return out, None
+    if provider == "guerrilla":
+        sid = extra.get("sid_token", "")
+        data = tm_request_json(
+            "GET",
+            "https://api.guerrillamail.com/ajax.php?f=check_email&sid_token="
+            + sid + "&seq=0",
+        )
+        if not data:
+            return None, "Guerrilla Mail inbox pora jayni (session sesh hole Change Mail korun)."
+        for item in (data.get("list", []) or [])[:5]:
+            full = tm_request_json(
+                "GET",
+                "https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token="
+                + sid + "&email_id=" + str(item.get("mail_id", "")),
+            ) or {}
+            out.append({
+                "from": item.get("mail_from", ""),
+                "subject": item.get("mail_subject", ""),
+                "body": tm_strip_html(full.get("mail_body", "") or item.get("mail_excerpt", "")),
+            })
+        return out, None
+    if provider == "maildrop":
+        mailbox = extra.get("mailbox", "")
+        q = {"query": 'query Example { inbox(mailbox: "' + mailbox + '") { id headerfrom subject date } }'}
+        data = tm_request_json("POST", "https://api.maildrop.cc/graphql", q)
+        if not data or data.get("errors"):
+            return None, "Maildrop inbox pora jayni, abar Check korun."
+        inbox = (data.get("data", {}) or {}).get("inbox", []) or []
+        for item in inbox[:5]:
+            mq = {"query": 'query Example { message(mailbox: "' + mailbox + '", id: "' + str(item.get("id", "")) + '") { id headerfrom subject date data html } }'}
+            full = tm_request_json("POST", "https://api.maildrop.cc/graphql", mq) or {}
+            msg = ((full.get("data", {}) or {}).get("message", {}) or {})
+            body = msg.get("data") or tm_strip_html(msg.get("html", ""))
+            out.append({
+                "from": item.get("headerfrom", ""),
+                "subject": item.get("subject", ""),
+                "body": body,
+            })
+        return out, None
+    return None, "Ochena provider."
+
+
+
+def tm_check_fast(saved):
+    # Fast path: Check chapar por 1-2 second-e code deoar jonno.
+    # Prothome shudhu mail-er LIST (1 ta request) theke code khunji:
+    # Mail.tm-er intro, Guerrilla-r excerpt, 1SecMail/Maildrop-er subject.
+    # Code paoa gele ar full body fetch kora lage na, tai uttor druto ase.
+    # Code na paoa gele ba inbox khali hole caller full tm_messages-e jabe.
+    # Returns (messages_or_None, error_or_None, has_code_bool)
+    provider = saved["provider"]
+    extra = saved["extra"]
+    if provider == "mailtm":
+        data = tm_request_json(
+            "GET", "https://api.mail.tm/messages",
+            headers={"Authorization": "Bearer " + extra.get("token", "")},
+        )
+        if not data:
+            return None, None, False
+        out = []
+        for m in (data.get("hydra:member", []) or [])[:5]:
+            frm = m.get("from", {}) or {}
+            out.append({
+                "from": frm.get("address", "") or frm.get("name", ""),
+                "subject": m.get("subject", ""),
+                "body": m.get("intro", ""),
+            })
+        has = any(tm_find_codes(m["subject"] + " " + m["body"]) for m in out)
+        return out, None, has
+    if provider == "1secmail":
+        data = tm_request_json(
+            "GET",
+            "https://www.1secmail.com/api/v1/?action=getMessages&login="
+            + extra.get("login", "") + "&domain=" + extra.get("domain", ""),
+        )
+        if data is None:
+            return None, None, False
+        out = []
+        for item in list(data)[-5:][::-1]:
+            out.append({
+                "from": item.get("from", ""),
+                "subject": item.get("subject", ""),
+                "body": "",
+            })
+        has = any(tm_find_codes(m["subject"]) for m in out)
+        return out, None, has
+    if provider == "guerrilla":
+        data = tm_request_json(
+            "GET",
+            "https://api.guerrillamail.com/ajax.php?f=check_email&sid_token="
+            + extra.get("sid_token", "") + "&seq=0",
+        )
+        if not data:
+            return None, None, False
+        out = []
+        for item in (data.get("list", []) or [])[:5]:
+            out.append({
+                "from": item.get("mail_from", ""),
+                "subject": item.get("mail_subject", ""),
+                "body": item.get("mail_excerpt", ""),
+            })
+        has = any(tm_find_codes(m["subject"] + " " + m["body"]) for m in out)
+        return out, None, has
+    if provider == "maildrop":
+        mailbox = extra.get("mailbox", "")
+        q = {"query": 'query Example { inbox(mailbox: "' + mailbox + '") { id headerfrom subject date } }'}
+        data = tm_request_json("POST", "https://api.maildrop.cc/graphql", q)
+        if not data or data.get("errors"):
+            return None, None, False
+        out = []
+        for item in ((data.get("data", {}) or {}).get("inbox", []) or [])[:5]:
+            out.append({
+                "from": item.get("headerfrom", ""),
+                "subject": item.get("subject", ""),
+                "body": "",
+            })
+        has = any(tm_find_codes(m["subject"]) for m in out)
+        return out, None, has
+    return None, None, False
+
+def tm_menu_text_and_markup(user_id):
+    saved = tm_get_saved(user_id)
+    buttons = []
+    row = []
+    for key, label in TM_PROVIDERS:
+        row.append(InlineKeyboardButton(label, callback_data="tmprov:" + key))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    if saved:
+        text = (
+            "📧 <b>Temp Mail — Free</b>\n\n"
+            "Tomar mail:\n" + code(saved["address"]) + "\n"
+            "Provider: " + esc(TM_PROVIDER_NAMES.get(saved["provider"], saved["provider"])) + "\n\n"
+            "Ei mail ta site-e dao, tarpor 📥 Check Code chapo. "
+            "Site theke abar code pathale abar Check chape notun code asbe.\n\n"
+            "⚠️ Inbox asthayi — code paoar sathe sathe bebohar koro. "
+            "Guruttopurno account-er code ekhane nio na."
+        )
+        buttons.append([InlineKeyboardButton("📥 Check Code", callback_data="tmcheck")])
+        buttons.append([InlineKeyboardButton("🔄 Change Mail", callback_data="tmchange")])
+        buttons.append([InlineKeyboardButton("🗑️ Delete Mail", callback_data="tmdelete")])
+    else:
+        text = (
+            "📧 <b>Temp Mail — Free</b>\n\n"
+            "Provider beche nau, bot ekta temp mail baniye dibe. "
+            "Jar jeta iccha, sei provider diye kaj korte parbe.\n\n"
+            "Mail.tm: password+token diye surakkha thake.\n"
+            "1SecMail / Maildrop: inbox public, thikana janlei pora jay.\n"
+            "Guerrilla Mail: 1 ghontar jonno thake."
+        )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def tm_gate_callback(query, user_id):
+    if is_admin(user_id):
+        return True
+    member = await is_channel_member(query.bot, user_id)
+    if member is True:
+        return True
+    if member is None:
+        await query.answer("⚠️ Verify check kora jacche na.", show_alert=True)
+        await query.message.reply_text(
+            "⚠️ ভেরিফাই চেক করা যাচ্ছে না। বটকে চ্যানেলে অ্যাডমিন করা আছে কিনা দেখুন।\n"
+            f"চ্যানেল: {FORCE_JOIN_LINK}"
+        )
+        return False
+    await query.answer("❌ Age channel-e join kore Verify korun.", show_alert=True)
+    await query.message.reply_text(force_join_text(), reply_markup=force_join_keyboard(), parse_mode="HTML")
+    return False
+
+
+async def menu_tempmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.message.from_user)
+    if not await check_force_join(update.message, context.bot, update.message.from_user.id):
+        return
+    text, markup = tm_menu_text_and_markup(update.message.from_user.id)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def tempmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await menu_tempmail(update, context)
+
+
+async def tm_provider_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await tm_gate_callback(query, user_id):
+        return
+    provider = query.data.split(":", 1)[1]
+    if provider not in TM_PROVIDER_NAMES:
+        return
+    old = tm_get_saved(user_id)
+    if old:
+        tm_remote_delete(old)
+        tm_delete_saved(user_id)
+    address, extra_or_error = tm_create(provider)
+    if not address:
+        await query.edit_message_text(
+            "❌ " + extra_or_error + "\n\nOnno provider try korun.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")]
+            ]),
+        )
+        return
+    tm_save(user_id, provider, address, extra_or_error)
+    text, markup = tm_menu_text_and_markup(user_id)
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def tm_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await tm_gate_callback(query, query.from_user.id):
+        return
+    text, markup = tm_menu_text_and_markup(query.from_user.id)
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def tm_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await tm_gate_callback(query, user_id):
+        return
+    saved = tm_get_saved(user_id)
+    if not saved:
+        text, markup = tm_menu_text_and_markup(user_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        return
+    provider = saved["provider"]
+    tm_remote_delete(saved)
+    tm_delete_saved(user_id)
+    address, extra_or_error = tm_create(provider)
+    if not address:
+        await query.edit_message_text(
+            "❌ " + extra_or_error,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")]
+            ]),
+        )
+        return
+    tm_save(user_id, provider, address, extra_or_error)
+    text, markup = tm_menu_text_and_markup(user_id)
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def tm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await tm_gate_callback(query, user_id):
+        return
+    saved = tm_get_saved(user_id)
+    if saved:
+        tm_remote_delete(saved)
+        tm_delete_saved(user_id)
+    text, markup = tm_menu_text_and_markup(user_id)
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def tm_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("📥 Inbox check kora hocche...")
+    user_id = query.from_user.id
+    if not await tm_gate_callback(query, user_id):
+        return
+    saved = tm_get_saved(user_id)
+    if not saved:
+        text, markup = tm_menu_text_and_markup(user_id)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        return
+    # Fast path age: list thekei code paoa gele 1 ta request-ei uttor.
+    fast_messages, _fast_error, fast_has_code = tm_check_fast(saved)
+    if fast_messages is not None and (not fast_messages or fast_has_code):
+        messages, error = fast_messages, None
+    else:
+        messages, error = tm_messages(saved)
+        # Guerrilla-r list dwitiyo bar khali aste pare, tai full fetch
+        # khali/error hole fast-er paoa mail-guloi dekhano hobe.
+        if (error or not messages) and fast_messages:
+            messages, error = fast_messages, None
+    buttons = [
+        [InlineKeyboardButton("📥 Check Code", callback_data="tmcheck")],
+        [InlineKeyboardButton("🔄 Change Mail", callback_data="tmchange")],
+        [InlineKeyboardButton("🗑️ Delete Mail", callback_data="tmdelete")],
+        [InlineKeyboardButton("⬅️ Provider List", callback_data="tmback")],
+    ]
+    if error:
+        await query.edit_message_text(
+            "❌ " + error + "\n\nMail: " + code(saved["address"]),
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML",
+        )
+        return
+    if not messages:
+        await query.edit_message_text(
+            "📭 <b>Ekhono kono mail aseni.</b>\n\n"
+            "Mail: " + code(saved["address"]) + "\n"
+            "Site-e code pathanor 30 second - 1 minute por abar 📥 Check Code chapo.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML",
+        )
+        return
+    parts = [
+        "📧 <b>Temp Mail — Inbox</b>\n\nMail: " + code(saved["address"]) + "\n"
+    ]
+    for m in messages:
+        frm = esc(m.get("from", ""))
+        subj = esc(m.get("subject", ""))
+        body = m.get("body", "") or ""
+        codes = tm_find_codes(subj + " " + body)
+        snippet = esc(tm_strip_html(body)[:200])
+        block = "✉️ <b>From:</b> " + frm + "\n<b>Subject:</b> " + subj + "\n"
+        if codes:
+            block += "<b>Code:</b> " + " ".join(code(c) for c in codes) + "\n"
+        if snippet:
+            block += snippet + "\n"
+        parts.append(block)
+    text = "\n".join(parts)[:3800]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
 
 # ---------------- Force join (channel join + Verify Access) ----------------
 
@@ -1318,7 +1899,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user.id):
         await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
         return
-    message = " ".join(context.args).strip()
+    message = (raw_command_text(update, 1) or " ".join(context.args)).strip()
     if not message:
         await update.message.reply_text(
             "ব্যবহার: /broadcast <মেসেজ>\nযেমন: /broadcast নতুন অফার! আজ থেকে সব VPN-এ ছাড়।"
@@ -1362,7 +1943,7 @@ async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("User ID সংখ্যায় লিখতে হবে। যেমন: /sendvpn 123456789 username: abc")
         return
-    details = " ".join(context.args[1:]).strip()
+    details = (raw_command_text(update, 2) or " ".join(context.args[1:])).strip()
     if not details:
         await update.message.reply_text("VPN details লিখতে হবে। যেমন: /sendvpn 123456789 username: abc password: xyz")
         return
@@ -1402,7 +1983,7 @@ async def sendproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("User ID সংখ্যায় লিখতে হবে। যেমন: /sendproxy 123456789 host: x.x.x.x")
         return
-    details = " ".join(context.args[1:]).strip()
+    details = (raw_command_text(update, 2) or " ".join(context.args[1:])).strip()
     if not details:
         await update.message.reply_text("Proxy details লিখতে হবে।")
         return
@@ -1447,7 +2028,7 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     target_id = int(context.args[0])
-    text = " ".join(context.args[1:])
+    text = raw_command_text(update, 2) or " ".join(context.args[1:])
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -1904,6 +2485,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("Referral"), menu_referral))
     app.add_handler(MessageHandler(filters.Regex("Support"), menu_support))
     app.add_handler(MessageHandler(filters.Regex("আমার অর্ডার"), menu_my_orders))
+    app.add_handler(CommandHandler("tempmail", tempmail_command))
+    app.add_handler(MessageHandler(filters.Regex("Temp Mail"), menu_tempmail))
+    app.add_handler(CallbackQueryHandler(tm_provider_callback, pattern=r"^tmprov:"))
+    app.add_handler(CallbackQueryHandler(tm_check_callback, pattern=r"^tmcheck$"))
+    app.add_handler(CallbackQueryHandler(tm_change_callback, pattern=r"^tmchange$"))
+    app.add_handler(CallbackQueryHandler(tm_delete_callback, pattern=r"^tmdelete$"))
+    app.add_handler(CallbackQueryHandler(tm_back_callback, pattern=r"^tmback$"))
     app.add_handler(CallbackQueryHandler(verify_join_callback, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(package_selected, pattern=r"^pkg:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_with_balance, pattern=r"^paybal:\d+$"))
