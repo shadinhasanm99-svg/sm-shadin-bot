@@ -29,7 +29,9 @@ Auto Balance system (SQLite database):
     (/sendproxy diye).
   - Admin command: /addbalance <user_id> <taka>  (shudhu admin)
     /exportbalances  (shudhu admin, balance-er backup list)
+    /exportusers + /importusers  (shudhu admin, user list backup/restore)
   /broadcast <message>  (shudhu admin, sob user-ke message pathay)
+  /updatenotice  (shudhu admin, sob user-ke update message pathay)
   /sendvpn <user_id> <details>  (shudhu admin, customer-ke VPN account pathay)
   /sendproxy <user_id> <details>  (shudhu admin, customer-ke Proxy details pathay)
   /users  (shudhu admin, mot bot user sonkha dekhay)
@@ -1411,6 +1413,65 @@ async def exportbalances_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def exportusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    ids = get_all_user_ids()
+    if not ids:
+        await update.message.reply_text("কোনো ইউজার পাওয়া যায়নি।")
+        return
+    sep = chr(10)
+    header = f"👥 User Backup List (মোট {len(ids)} জন):"
+    chunk = header
+    for uid in ids:
+        line = str(uid)
+        if len(chunk) + 1 + len(line) > 3800:
+            await update.message.reply_text(chunk)
+            chunk = line
+        else:
+            chunk = chunk + sep + line
+    await update.message.reply_text(chunk)
+    await update.message.reply_text("এই লিস্টটা সেভ করে রাখো। Deploy-এর পর /importusers দিয়ে ফিরিয়ে দিতে পারবে। ব্যালেন্স আলাদা করে /exportbalances + /addbalance দিয়ে ফেরাতে হবে।")
+
+
+async def importusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    raw = raw_command_text(update, 1) or " ".join(context.args)
+    ids = []
+    for num in re.findall(r"\d+", raw or ""):
+        try:
+            val = int(num)
+        except ValueError:
+            continue
+        if val >= 1000000 and val not in ids:
+            ids.append(val)
+    if not ids:
+        await update.message.reply_text(
+            "ব্যবহার: /importusers <user_id লিস্ট>\n"
+            "যেমন: /importusers 123456789 987654321\n"
+            "বা /exportusers-এর লিস্টটা কপি করে /importusers-এর পরে পেস্ট করো।"
+        )
+        return
+    conn = get_conn()
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)",
+        [(i,) for i in ids],
+    )
+    conn.commit()
+    added = conn.total_changes - before
+    conn.close()
+    total = get_user_count()
+    await update.message.reply_text(
+        f"✅ Import শেষ! নতুন ইউজার যোগ: {added} জন, মোট ইউজার: {total} জন।"
+    )
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     if not is_admin(user.id):
@@ -1442,6 +1503,30 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
         await asyncio.sleep(0.05)
     await update.message.reply_text(f"✅ Broadcast শেষ! পেয়েছে: {success} জন, পায়নি: {failed} জন।")
+
+
+async def updatenotice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    if not is_admin(user.id):
+        await update.message.reply_text("এই কমান্ড শুধু অ্যাডমিন ব্যবহার করতে পারবে।")
+        return
+    user_ids = get_all_user_ids()
+    if not user_ids:
+        await update.message.reply_text("কোনো ইউজার পাওয়া যায়নি। কেউ /start করলে তবেই notice যাবে।")
+        return
+    await update.message.reply_text(f"📢 Update notice পাঠানো হচ্ছে, মোট ইউজার: {len(user_ids)} জন...")
+    text = "📢 বটটি আপডেট করা হয়েছে, নতুন ফিচার ব্যবহার করতে /start বাটনে ক্লিক করুন।"
+    success = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            success += 1
+        except Exception as exc:
+            logger.warning("Update notice pathate parini %s: %s", uid, exc)
+            failed += 1
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(f"✅ Update notice শেষ! পেয়েছে: {success} জন, পায়নি: {failed} জন।")
 
 
 async def sendvpn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1988,7 +2073,10 @@ def main():
     app.add_handler(CommandHandler("support", support_command))
     app.add_handler(CommandHandler("addbalance", addbalance_command))
     app.add_handler(CommandHandler("exportbalances", exportbalances_command))
+    app.add_handler(CommandHandler("exportusers", exportusers_command))
+    app.add_handler(CommandHandler("importusers", importusers_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("updatenotice", updatenotice_command))
     app.add_handler(CommandHandler("sendvpn", sendvpn_command))
     app.add_handler(CommandHandler("sendproxy", sendproxy_command))
     app.add_handler(CommandHandler("users", users_command))
