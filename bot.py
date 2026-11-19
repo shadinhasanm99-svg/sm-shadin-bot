@@ -141,6 +141,8 @@ PROXIES = [
     ("200 MB (711Proxy)", "LT", 35),
     ("100 MB (H143Proxy)", "LT", 19),
     ("200 MB (H143Proxy)", "LT", 23),
+    ("500 MB (H143Proxy)", "LT", 20),
+    ("1 GB (H143Proxy)", "LT", 40),
 ]
 
 WAITING_PAYMENT = "waiting_payment"
@@ -1731,7 +1733,7 @@ def auto_reply_text(text):
             "10 IP (9Proxy) ৳59, 100 MB (9Proxy) ৳25, 200 MB (9Proxy) ৳35,\n"
             "100 MB (RapidProxy) ৳25, 200 MB (RapidProxy) ৳35,\n"
             "100 MB (711Proxy) ৳25, 200 MB (711Proxy) ৳35,\n"
-            "100 MB (H143Proxy) ৳19, 200 MB (H143Proxy) ৳23\n\n"
+            "100 MB (H143Proxy) ৳19, 200 MB (H143Proxy) ৳23, 500 MB (H143Proxy) ৳20, 1 GB (H143Proxy) ৳40\n\n"
             "কিনতে নিচের মেনু থেকে Buy Proxy চাপুন।"
         )
     if any(k in t for k in ("price", "dam", "দাম", "প্রাইস", "package", "প্যাকেজ", "list", "লিস্ট")):
