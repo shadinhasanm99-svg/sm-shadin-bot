@@ -132,17 +132,16 @@ PACKAGES = [
 # Jemon: 9Proxy 10 IP 49 -> 59, 9Proxy 100 MB 15 -> 25, ityadi.
 # Stock sonkha bot-e dekhano hoyni, karon bot stock auto komay na.
 PROXIES = [
-    ("10 IP (9Proxy)", "LT", 59),
-    ("100 MB (9Proxy)", "LT", 25),
-    ("200 MB (9Proxy)", "LT", 35),
-    ("100 MB (RapidProxy)", "LT", 25),
-    ("200 MB (RapidProxy)", "LT", 35),
-    ("100 MB (711Proxy)", "LT", 25),
-    ("200 MB (711Proxy)", "LT", 35),
-    ("100 MB (H143Proxy)", "LT", 19),
-    ("200 MB (H143Proxy)", "LT", 23),
-    ("500 MB (H143Proxy)", "LT", 20),
-    ("1 GB (H143Proxy)", "LT", 40),
+    ("10 IP (9Proxy)", "TK", 59),
+    ("100 MB (9Proxy)", "TK", 25),
+    ("200 MB (9Proxy)", "TK", 35),
+    ("100 MB (RapidProxy)", "TK", 25),
+    ("200 MB (RapidProxy)", "TK", 35),
+    ("100 MB (711Proxy)", "TK", 25),
+    ("200 MB (711Proxy)", "TK", 35),
+    ("200 MB (H143Proxy)", "TK", 10),
+    ("500 MB (H143Proxy)", "TK", 20),
+    ("1 GB (H143Proxy)", "TK", 40),
 ]
 
 WAITING_PAYMENT = "waiting_payment"
@@ -1733,7 +1732,7 @@ def auto_reply_text(text):
             "10 IP (9Proxy) ৳59, 100 MB (9Proxy) ৳25, 200 MB (9Proxy) ৳35,\n"
             "100 MB (RapidProxy) ৳25, 200 MB (RapidProxy) ৳35,\n"
             "100 MB (711Proxy) ৳25, 200 MB (711Proxy) ৳35,\n"
-            "100 MB (H143Proxy) ৳19, 200 MB (H143Proxy) ৳23, 500 MB (H143Proxy) ৳20, 1 GB (H143Proxy) ৳40\n\n"
+            "200 MB (H143Proxy) ৳10, 500 MB (H143Proxy) ৳20, 1 GB (H143Proxy) ৳40\n\n"
             "কিনতে নিচের মেনু থেকে Buy Proxy চাপুন।"
         )
     if any(k in t for k in ("price", "dam", "দাম", "প্রাইস", "package", "প্যাকেজ", "list", "লিস্ট")):
