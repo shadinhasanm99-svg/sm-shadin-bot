@@ -102,6 +102,13 @@ DB_PATH = os.environ.get("DB_PATH", "balance.db")
 
 BOT_USERNAME = "sm_shadin_shop_bot"
 PAYMENT_NUMBER = "01879173170"
+# Binance Pay (manual deposit, 2026-11-24, user-er deoa UID + rate):
+# Customer USDT pathabe ei UID-te, Order ID dibe, admin approve korle
+# 1 USDT = ৳125 hisebe BDT balance-e jog hobe. Kono auto-credit nei —
+# Binance personal UID transfer-er kono SMS/webhook nei, tai SMS AutoPay
+# ekhane cholbe na; admin Binance app-e Order ID dekhe verify korbe.
+BINANCE_UID = "1204191349"
+USDT_TO_BDT = 125
 ORDER_LINK = "https://t.me/BestservicSM"
 CHANNEL_LINK = "https://t.me/socialmarketing22"
 # Force-join channel (2026-10-28, user-er deoa channel):
@@ -139,6 +146,7 @@ PROXIES = [
     ("200 MB (RapidProxy)", "TK", 35),
     ("100 MB (711Proxy)", "TK", 25),
     ("200 MB (711Proxy)", "TK", 35),
+    ("100 MB (H143Proxy)", "TK", 5),
     ("200 MB (H143Proxy)", "TK", 10),
     ("500 MB (H143Proxy)", "TK", 20),
     ("1 GB (H143Proxy)", "TK", 40),
@@ -147,6 +155,7 @@ PROXIES = [
 WAITING_PAYMENT = "waiting_payment"
 WAITING_PROXY_PAYMENT = "waiting_proxy_payment"
 WAITING_DEPOSIT_AMOUNT = "waiting_deposit_amount"
+WAITING_DEPOSIT_METHOD = "waiting_deposit_method"
 WAITING_DEPOSIT_PROOF = "waiting_deposit_proof"
 WAITING_SUPPORT = "waiting_support"
 
@@ -222,6 +231,10 @@ def init_db():
     ):
         if _col not in _cols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_ddl}")
+    # Binance Pay deposit: purono DB-te method column na thakle jog hobe.
+    _dep_cols = [r[1] for r in conn.execute("PRAGMA table_info(deposits)").fetchall()]
+    if "method" not in _dep_cols:
+        conn.execute("ALTER TABLE deposits ADD COLUMN method TEXT DEFAULT 'bkash'")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS orders ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -523,12 +536,12 @@ def get_user_deposits(user_id, limit=5):
     return rows
 
 
-def create_deposit(user_id, username, amount, trxid):
+def create_deposit(user_id, username, amount, trxid, method="bkash"):
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO deposits (user_id, username, amount, trxid, status)"
-        " VALUES (?, ?, ?, ?, 'pending')",
-        (user_id, username or "", amount, trxid),
+        "INSERT INTO deposits (user_id, username, amount, trxid, status, method)"
+        " VALUES (?, ?, ?, ?, 'pending', ?)",
+        (user_id, username or "", amount, trxid, method),
     )
     dep_id = cur.lastrowid
     conn.commit()
@@ -980,6 +993,7 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("package", None)
     context.user_data.pop("proxy", None)
     context.user_data.pop("deposit_amount", None)
+    context.user_data.pop("deposit_method", None)
     await update.message.reply_text(
         "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
         "Minimum deposit ৳20।\n\n"
@@ -1275,6 +1289,39 @@ async def back_to_proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         "🌐 Proxy প্যাকেজসমূহ:", reply_markup=proxy_keyboard()
     )
+
+
+# ---------------- Deposit method choice ----------------
+
+async def deposit_method_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ensure_user(query.from_user)
+    if context.user_data.get("state") != WAITING_DEPOSIT_METHOD:
+        await query.edit_message_text("আগে Deposit থেকে টাকার পরিমাণ লিখুন।")
+        return
+    method = query.data.split(":")[1]
+    amount = context.user_data.get("deposit_amount", 0)
+    context.user_data["deposit_method"] = method
+    context.user_data["state"] = WAITING_DEPOSIT_PROOF
+    if method == "binance":
+        usdt = amount / USDT_TO_BDT
+        await query.edit_message_text(
+            f"💰 ৳{amount} Deposit করুন Binance Pay দিয়ে:\n"
+            f"🟡 Binance UID: {code(BINANCE_UID)}\n"
+            f"💵 পাঠাতে হবে: {usdt:.2f} USDT (1 USDT = ৳{USDT_TO_BDT})\n\n"
+            "✅ পেমেন্টের পর Binance Pay Order ID টা এখানে লিখে পাঠান।\n"
+            "অ্যাডমিন Order ID চেক করে Approve করলে আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।",
+            parse_mode="HTML",
+        )
+    else:
+        await query.edit_message_text(
+            f"💰 ৳{amount} Deposit করুন:\n"
+            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
+            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
+            "ধন্যবাদ।",
+            parse_mode="HTML",
+        )
 
 
 # ---------------- Deposit approve / reject (admin) ----------------
@@ -1857,19 +1904,24 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Minimum deposit ৳20। 20 বা তার বেশি লিখুন।")
             return
         context.user_data["deposit_amount"] = amount
-        context.user_data["state"] = WAITING_DEPOSIT_PROOF
+        context.user_data["state"] = WAITING_DEPOSIT_METHOD
         await update.message.reply_text(
-            f"💰 ৳{amount} Deposit করুন:\n"
-            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
-            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
-            "ধন্যবাদ।"
-            , parse_mode="HTML",
+            f"💰 ৳{amount} Deposit করবেন — কীভাবে পাঠাবেন, বেছে নিন:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "💵 বিকাশ / নগদ", callback_data="dep_method:bkash"
+                )],
+                [InlineKeyboardButton(
+                    "🟡 Binance Pay (USDT)", callback_data="dep_method:binance"
+                )],
+            ]),
         )
         return
 
     # Step 2: Deposit-er proman (TrxID / screenshot)
     if state == WAITING_DEPOSIT_PROOF:
         amount = context.user_data.get("deposit_amount", 0)
+        method = context.user_data.get("deposit_method", "bkash")
         if not ADMIN_ID:
             await update.message.reply_text(
                 "দুঃখিত, এখন Deposit নেওয়া যাচ্ছে না। সরাসরি এখানে মেসেজ করুন:\n"
@@ -1881,7 +1933,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             trxid = (update.message.text or "").strip()
         # ---- SMS AutoPay: text TrxID hole age auto-match check korun ----
-        if not update.message.photo and trxid:
+        # Binance Pay-te SMS nei, tai auto-match shudhu bKash/Nagad-er jonno.
+        if method == "bkash" and not update.message.photo and trxid:
             trxid_clean = trxid.upper().strip()
             if " " in trxid_clean:
                 _m = re.search(r"\b[A-Z0-9]{8,12}\b", trxid_clean)
@@ -1924,15 +1977,40 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                     except Exception:
                         pass
                 return
-        dep_id = create_deposit(user.id, user.username, amount, trxid)
-        caption = (
-            "💰 নতুন Deposit Request!\n"
-            f"👤 কাস্টমার: {esc(customer_label(user))}\n"
-            f"🆔 User ID: {code(user.id)}\n"
-            f"💵 পরিমাণ: ৳{amount}\n"
-            f"📝 TrxID / মেসেজ: {code(trxid) if trxid else '-'}\n"
-            "⚠️ Auto-match hoyni (SMS ekhono aseni ba TrxID mileni) — manual check korun."
-        )
+        # ---- Binance Pay: Order ID duplicate check (kono SMS auto-match nei) ----
+        if method == "binance" and trxid:
+            _m = re.search(r"\d{10,}", trxid.replace(" ", ""))
+            order_id = _m.group(0) if _m else trxid.replace(" ", "")
+            if is_trxid_already_credited(order_id):
+                context.user_data.clear()
+                await update.message.reply_text(
+                    "❌ এই Order ID দিয়ে আগেই ব্যালেন্স দেওয়া হয়েছে।\n"
+                    "একই Order ID দুবার ব্যবহার করা যাবে না।\n"
+                    "এটা আপনার পেমেন্ট হলে Support-এ মেসেজ করুন।"
+                )
+                return
+            trxid = order_id
+        dep_id = create_deposit(user.id, user.username, amount, trxid, method)
+        if method == "binance":
+            usdt = amount / USDT_TO_BDT
+            caption = (
+                "💰 নতুন Deposit Request! (Binance Pay)\n"
+                f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+                f"🆔 User ID: {code(user.id)}\n"
+                f"💵 পরিমাণ: ৳{amount} ({usdt:.2f} USDT, 1 USDT = ৳{USDT_TO_BDT})\n"
+                f"🟡 Binance UID: {code(BINANCE_UID)}\n"
+                f"📝 Order ID: {code(trxid) if trxid else '-'}\n"
+                "⚠️ Manual check korun — Binance app-e Order ID দেখে verify করুন। SMS auto-match এখানে চলে না।"
+            )
+        else:
+            caption = (
+                "💰 নতুন Deposit Request!\n"
+                f"👤 কাস্টমার: {esc(customer_label(user))}\n"
+                f"🆔 User ID: {code(user.id)}\n"
+                f"💵 পরিমাণ: ৳{amount}\n"
+                f"📝 TrxID / মেসেজ: {code(trxid) if trxid else '-'}\n"
+                "⚠️ Auto-match hoyni (SMS ekhono aseni ba TrxID mileni) — manual check korun."
+            )
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
@@ -1954,11 +2032,17 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=ADMIN_ID, text=caption, reply_markup=keyboard, parse_mode="HTML",
             )
         context.user_data.clear()
-        await update.message.reply_text(
-            "✅ Deposit request পৌঁছেছে! SMS-এর সাথে TrxID মেলেনি, তাই "
-            "অটো হয়নি — অ্যাডমিন চেক করে Approve করলে "
-            "আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।"
-        )
+        if method == "binance":
+            await update.message.reply_text(
+                "✅ Deposit request পৌঁছেছে! অ্যাডমিন Binance Pay Order ID "
+                "চেক করে Approve করলে আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।"
+            )
+        else:
+            await update.message.reply_text(
+                "✅ Deposit request পৌঁছেছে! SMS-এর সাথে TrxID মেলেনি, তাই "
+                "অটো হয়নি — অ্যাডমিন চেক করে Approve করলে "
+                "আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।"
+            )
         return
 
     # Cash-e Proxy kenar proman (manual jachai)
@@ -2100,6 +2184,7 @@ def main():
     app.add_handler(CallbackQueryHandler(pay_proxy_with_balance, pattern=r"^proxpaybal:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_proxy_with_cash, pattern=r"^proxpaycash:\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_proxy_list, pattern=r"^proxyback$"))
+    app.add_handler(CallbackQueryHandler(deposit_method_chosen, pattern=r"^dep_method:(bkash|binance)$"))
     app.add_handler(CallbackQueryHandler(approve_deposit, pattern=r"^dep_approve:\d+$"))
     app.add_handler(CallbackQueryHandler(reject_deposit, pattern=r"^dep_reject:\d+$"))
     app.add_handler(
