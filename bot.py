@@ -103,10 +103,12 @@ DB_PATH = os.environ.get("DB_PATH", "balance.db")
 BOT_USERNAME = "sm_shadin_shop_bot"
 PAYMENT_NUMBER = "01879173170"
 # Binance Pay (manual deposit, 2026-11-24, user-er deoa UID + rate):
-# Customer USDT pathabe ei UID-te, Order ID dibe, admin approve korle
-# 1 USDT = ৳125 hisebe BDT balance-e jog hobe. Kono auto-credit nei —
-# Binance personal UID transfer-er kono SMS/webhook nei, tai SMS AutoPay
-# ekhane cholbe na; admin Binance app-e Order ID dekhe verify korbe.
+# Deposit-er prothom message-ei UID dekhano hoy, bKash/Nagad number-er niche.
+# Customer doshomik poriman likhle (jemon 0.20) seta USDT dhora hoy,
+# minimum 0.20 USDT; 1 USDT = ৳125 hisebe BDT balance-e jog hoy (admin
+# approve korle). Kono auto-credit nei — Binance personal UID transfer-er
+# kono SMS/webhook nei, tai SMS AutoPay ekhane cholbe na; admin Binance
+# app-e Order ID dekhe verify korbe.
 BINANCE_UID = "1204191349"
 USDT_TO_BDT = 125
 ORDER_LINK = "https://t.me/BestservicSM"
@@ -155,7 +157,6 @@ PROXIES = [
 WAITING_PAYMENT = "waiting_payment"
 WAITING_PROXY_PAYMENT = "waiting_proxy_payment"
 WAITING_DEPOSIT_AMOUNT = "waiting_deposit_amount"
-WAITING_DEPOSIT_METHOD = "waiting_deposit_method"
 WAITING_DEPOSIT_PROOF = "waiting_deposit_proof"
 WAITING_SUPPORT = "waiting_support"
 
@@ -994,10 +995,14 @@ async def menu_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("proxy", None)
     context.user_data.pop("deposit_amount", None)
     context.user_data.pop("deposit_method", None)
+    context.user_data.pop("deposit_usdt", None)
     await update.message.reply_text(
-        "💰 Deposit করতে প্রথমে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
-        "Minimum deposit ৳20।\n\n"
-        f"টাকা পাঠাবেন এই নম্বরে:\nবিকাশ / নগদ: {code(PAYMENT_NUMBER)}"
+        "💰 Deposit করতে প্রথমে কত জমা দেবেন, শুধু সংখ্যাটা লিখুন।\n"
+        "বিকাশ / নগদ হলে টাকা, Binance Pay হলে USDT লিখুন (যেমন 0.20)।\n"
+        "Minimum deposit ৳20 / 0.20 USDT।\n\n"
+        "টাকা পাঠাবেন এই নম্বরে:\n"
+        f"বিকাশ / নগদ: {code(PAYMENT_NUMBER)}\n"
+        f"🟡 Binance Pay UID: {code(BINANCE_UID)}"
         , parse_mode="HTML",
     )
 
@@ -1289,39 +1294,6 @@ async def back_to_proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         "🌐 Proxy প্যাকেজসমূহ:", reply_markup=proxy_keyboard()
     )
-
-
-# ---------------- Deposit method choice ----------------
-
-async def deposit_method_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ensure_user(query.from_user)
-    if context.user_data.get("state") != WAITING_DEPOSIT_METHOD:
-        await query.edit_message_text("আগে Deposit থেকে টাকার পরিমাণ লিখুন।")
-        return
-    method = query.data.split(":")[1]
-    amount = context.user_data.get("deposit_amount", 0)
-    context.user_data["deposit_method"] = method
-    context.user_data["state"] = WAITING_DEPOSIT_PROOF
-    if method == "binance":
-        usdt = amount / USDT_TO_BDT
-        await query.edit_message_text(
-            f"💰 ৳{amount} Deposit করুন Binance Pay দিয়ে:\n"
-            f"🟡 Binance UID: {code(BINANCE_UID)}\n"
-            f"💵 পাঠাতে হবে: {usdt:.2f} USDT (1 USDT = ৳{USDT_TO_BDT})\n\n"
-            "✅ পেমেন্টের পর Binance Pay Order ID টা এখানে লিখে পাঠান।\n"
-            "অ্যাডমিন Order ID চেক করে Approve করলে আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।",
-            parse_mode="HTML",
-        )
-    else:
-        await query.edit_message_text(
-            f"💰 ৳{amount} Deposit করুন:\n"
-            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
-            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
-            "ধন্যবাদ।",
-            parse_mode="HTML",
-        )
 
 
 # ---------------- Deposit approve / reject (admin) ----------------
@@ -1885,16 +1857,44 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # Step 1: Deposit-er taka-r poriman
+    # Step 1: Deposit-er poriman — integer hole BDT (bKash/Nagad),
+    # doshomik hole USDT (Binance Pay, 1 USDT = ৳125).
     if state == WAITING_DEPOSIT_AMOUNT:
         if update.message.photo:
             await update.message.reply_text(
-                "আগে কত টাকা জমা দেবেন, শুধু সংখ্যাটা লিখুন।"
+                "আগে কত জমা দেবেন, শুধু সংখ্যাটা লিখুন।"
             )
             return
-        raw = (update.message.text or "").strip().replace("৳", "").replace(",", "")
+        raw = (update.message.text or "").strip().replace("৳", "").replace("$", "").replace(" ", "")
+        if "." in raw:
+            try:
+                usdt = float(raw)
+            except ValueError:
+                await update.message.reply_text("শুধু সংখ্যাটা লিখুন।")
+                return
+            if usdt < 0.20:
+                await update.message.reply_text(
+                    "Binance Pay minimum deposit 0.20 USDT। 0.20 বা তার বেশি লিখুন।"
+                )
+                return
+            # Paisa hisebe integer math — float rounding jhamela erabe.
+            usdt_cents = int(round(usdt * 100))
+            amount = (usdt_cents * USDT_TO_BDT + 50) // 100
+            context.user_data["deposit_amount"] = amount
+            context.user_data["deposit_usdt"] = usdt_cents / 100
+            context.user_data["deposit_method"] = "binance"
+            context.user_data["state"] = WAITING_DEPOSIT_PROOF
+            await update.message.reply_text(
+                f"💰 {usdt_cents / 100:.2f} USDT (৳{amount}) Deposit করুন Binance Pay দিয়ে:\n"
+                f"🟡 Binance UID: {code(BINANCE_UID)}\n\n"
+                "✅ পেমেন্টের পর Binance Pay Order ID টা এখানে লিখে পাঠান।\n"
+                "অ্যাডমিন Order ID চেক করে Approve করলে আপনার ব্যালেন্সে টাকা যোগ হয়ে যাবে।",
+                parse_mode="HTML",
+            )
+            return
+        raw_int = raw.replace(",", "")
         try:
-            amount = int(raw)
+            amount = int(raw_int)
         except ValueError:
             await update.message.reply_text(
                 "শুধু সংখ্যাটা লিখুন।"
@@ -1904,17 +1904,14 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Minimum deposit ৳20। 20 বা তার বেশি লিখুন।")
             return
         context.user_data["deposit_amount"] = amount
-        context.user_data["state"] = WAITING_DEPOSIT_METHOD
+        context.user_data["deposit_method"] = "bkash"
+        context.user_data["state"] = WAITING_DEPOSIT_PROOF
         await update.message.reply_text(
-            f"💰 ৳{amount} Deposit করবেন — কীভাবে পাঠাবেন, বেছে নিন:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "💵 বিকাশ / নগদ", callback_data="dep_method:bkash"
-                )],
-                [InlineKeyboardButton(
-                    "🟡 Binance Pay (USDT)", callback_data="dep_method:binance"
-                )],
-            ]),
+            f"💰 ৳{amount} Deposit করুন:\n"
+            f"বিকাশ / নগদ Send Money করুন: {code(PAYMENT_NUMBER)}\n\n"
+            "✅ TrxID সেন্ট করেন, আপনার ব্যালেন্স সাথে সাথে এড হয়ে যাবে অটো বট চেকের মাধ্যমে।\n"
+            "ধন্যবাদ।"
+            , parse_mode="HTML",
         )
         return
 
@@ -1992,12 +1989,13 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             trxid = order_id
         dep_id = create_deposit(user.id, user.username, amount, trxid, method)
         if method == "binance":
-            usdt = amount / USDT_TO_BDT
+            usdt = context.user_data.get("deposit_usdt")
+            usdt_text = f"{usdt:.2f} USDT" if usdt else f"{amount / USDT_TO_BDT:.2f} USDT"
             caption = (
                 "💰 নতুন Deposit Request! (Binance Pay)\n"
                 f"👤 কাস্টমার: {esc(customer_label(user))}\n"
                 f"🆔 User ID: {code(user.id)}\n"
-                f"💵 পরিমাণ: ৳{amount} ({usdt:.2f} USDT, 1 USDT = ৳{USDT_TO_BDT})\n"
+                f"💵 পরিমাণ: {usdt_text} = ৳{amount} (1 USDT = ৳{USDT_TO_BDT})\n"
                 f"🟡 Binance UID: {code(BINANCE_UID)}\n"
                 f"📝 Order ID: {code(trxid) if trxid else '-'}\n"
                 "⚠️ Manual check korun — Binance app-e Order ID দেখে verify করুন। SMS auto-match এখানে চলে না।"
@@ -2184,7 +2182,6 @@ def main():
     app.add_handler(CallbackQueryHandler(pay_proxy_with_balance, pattern=r"^proxpaybal:\d+$"))
     app.add_handler(CallbackQueryHandler(pay_proxy_with_cash, pattern=r"^proxpaycash:\d+$"))
     app.add_handler(CallbackQueryHandler(back_to_proxy_list, pattern=r"^proxyback$"))
-    app.add_handler(CallbackQueryHandler(deposit_method_chosen, pattern=r"^dep_method:(bkash|binance)$"))
     app.add_handler(CallbackQueryHandler(approve_deposit, pattern=r"^dep_approve:\d+$"))
     app.add_handler(CallbackQueryHandler(reject_deposit, pattern=r"^dep_reject:\d+$"))
     app.add_handler(
